@@ -21,10 +21,22 @@ app = FastAPI(
 # Initialized at startup for Apple Silicon memory stability
 engine = SDXLEngine(model_path="./models/sdxl-base")
 logger = logging.getLogger("sdxl_api")
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "request_id"):
+            record.request_id = "-"
+        return True
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s request_id=%(request_id)s %(message)s",
 )
+for handler in logging.getLogger().handlers:
+    handler.addFilter(RequestIdFilter())
+
 APP_ENV = os.getenv("APP_ENV", "dev").lower()
 
 _metrics_lock = threading.Lock()
@@ -208,7 +220,6 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
             "clip_skip": payload.clip_skip,
             "scheduler": payload.scheduler,
             "seed": used_seed,
-            "lora": payload.lora_path,
         }
     )
 

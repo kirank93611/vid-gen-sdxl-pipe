@@ -177,6 +177,16 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics["generate_timeout_total"], 1)
         self.assertEqual(metrics["generate_inflight"], 0)
 
+    async def test_generate_rejects_deferred_lora_fields(self) -> None:
+        resp = await self.client.post(
+            "/generate",
+            json={"prompt": "test", "lora_path": "string"},
+        )
+
+        self.assertEqual(resp.status_code, 422)
+        body = resp.json()
+        self.assertEqual(body["detail"][0]["type"], "extra_forbidden")
+
 
 
 if __name__ == "__main__":

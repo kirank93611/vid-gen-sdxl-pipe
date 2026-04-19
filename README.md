@@ -23,14 +23,10 @@ This repository is intentionally code-only for collaboration.
 flowchart TD
     A["Client / Frontend"] --> B["FastAPI Routes"]
     B --> C["Validation (Pydantic Schemas)"]
-    C --> D["API Controls"]
-    D --> D1["API Key / Auth"]
-    D --> D2["Rate Limit / Backpressure"]
-    D --> D3["Timeout Guard"]
-    D3 --> E["run_in_executor"]
+    C --> D["Backpressure Guard"]
+    D --> E["Timeout Guard"]
     E --> F["SDXLEngine"]
     F --> G["Local SDXL Model"]
-    F --> H["Optional LoRA Injection"]
     F --> I["BytesIO Image Buffer"]
     I --> J["Base64 API Response"]
     B --> K["Metrics + Request ID Logging"]
@@ -63,7 +59,7 @@ source .venv/bin/activate
 If using `uv`, install project dependencies into the active virtual environment first:
 
 ```bash
-uv pip install fastapi uvicorn torch diffusers transformers accelerate pydantic pillow huggingface_hub peft httpx
+uv pip install fastapi uvicorn torch diffusers transformers accelerate pydantic pillow huggingface_hub httpx requests
 ```
 
 ## Download Model Locally
@@ -74,12 +70,6 @@ Run:
 
 ```bash
 python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='stabilityai/stable-diffusion-xl-base-1.0', local_dir='./models/sdxl-base', allow_patterns=['model_index.json','scheduler/*','tokenizer/*','tokenizer_2/*','text_encoder/config.json','text_encoder/model.fp16.safetensors','text_encoder_2/config.json','text_encoder_2/model.fp16.safetensors','vae/config.json','vae/diffusion_pytorch_model.fp16.safetensors','unet/config.json','unet/diffusion_pytorch_model.fp16.safetensors'])"
-```
-
-If you plan to use LoRA adapters, ensure `peft` is installed:
-
-```bash
-uv pip install peft
 ```
 
 ## Start the Server
@@ -182,8 +172,6 @@ Each response also includes an `X-Request-ID` header for tracing.
 - `guidance_scale`: default `1.0`, allowed `0.0` to `2.0`
 - `clip_skip`: default `2`
 - `scheduler`: `dpm++2m_karras` or `euler`
-- `lora_path`: optional local `.safetensors` path
-- `lora_scale`: optional LoRA strength
 
 ## Save the Returned Image
 
@@ -264,13 +252,6 @@ Error no file named model_index.json found in directory ./models/sdxl-base
 
 then the local model has not been downloaded yet. Run the model download command from the `Download Model Locally` section.
 
-If you get:
+If you send undeclared fields such as `lora_path`, the API returns `422 Unprocessable Entity`. Deferred features are intentionally blocked in the current build so the active product surface stays stable and readable for collaborators.
 
-```text
-PEFT backend is required for this method.
-```
-
-then you sent a `lora_path` value but do not have `peft` installed, or the LoRA setup is invalid. Either:
-
-- set `"lora_path": null`
-- or install `peft` and provide a real local `.safetensors` path
+If third-party logs appear during failures, they should now render with `request_id=-` instead of breaking the logging formatter.

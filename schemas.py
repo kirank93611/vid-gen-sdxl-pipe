@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Annotated
 
 # PEP 604: Using | instead of Optional/Union
@@ -9,6 +9,8 @@ class GenerateRequest(BaseModel):
     Validation schema for SDXL-Lightning generation.
     Optimized for Apple Silicon memory constraints.
     """
+    model_config = ConfigDict(extra="forbid")
+
     prompt: str = Field(..., description="The visual description of the image.")
     negative_prompt: str = Field(
         default="blurry, low quality, deformed, ugly, bad anatomy",
@@ -26,9 +28,6 @@ class GenerateRequest(BaseModel):
     
     clip_skip: Annotated[int, Field(default=2, ge=1, le=4)]
     scheduler: str = Field(default="dpm++2m_karras")
-
-    lora_path: str | None = Field(default=None, description="Local path to .safetensors")
-    lora_scale: Annotated[float, Field(default=0.6, ge=0.0, le=1.0)]
 
 class GenerateResponse(BaseModel):
     """

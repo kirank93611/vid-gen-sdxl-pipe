@@ -2,7 +2,6 @@ import torch
 import threading
 import io
 import os
-from pathlib import Path
 from typing import Annotated, Callable, Any
 from diffusers import (
     StableDiffusionXLPipeline, 
@@ -22,12 +21,11 @@ SCHEDULERS: dict[str, SchedulerFactory] = {
 class SDXLEngine:
     """
     Stateful engine for SDXL-Lightning inference.
-    Handles MPS device management and LoRA lifecycle.
+    Handles MPS device management and request-scoped pipeline mutation.
     """
     def __init__(self, model_path: str) -> None:
         self.model_path = model_path
         self.pipeline: StableDiffusionXLPipeline | None = None
-        self._loaded_lora: str | None = None
         self._lock = threading.Lock()
         self.load_model()
 
@@ -51,20 +49,6 @@ class SDXLEngine:
         self.pipeline.scheduler = SCHEDULERS["dpm++2m_karras"](self.pipeline.scheduler.config)
         print("Model initialized on MPS.")
 
-    def _manage_lora(self, lora_path: str | None) -> None:
-        """Handles on-demand LoRA swapping to maintain stateless request flow."""
-        if lora_path == self._loaded_lora:
-            return
-
-        if self._loaded_lora is not None:
-            self.pipeline.unload_lora_weights()
-
-        if lora_path:
-            # Multi-tenancy support: load specific style adapter
-            self.pipeline.load_lora_weights(lora_path)
-        
-        self._loaded_lora = lora_path
-
     def generate(self, req: GenerateRequest) -> tuple[bytes, int]:
         """
         Executes inference on MPS.
@@ -75,14 +59,11 @@ class SDXLEngine:
 
         seed = req.seed if req.seed is not None else torch.randint(0, 2**32 - 1, (1,)).item()
         generator = torch.Generator(device="mps").manual_seed(seed)
-        
-        cross_attention_kwargs = {"scale": req.lora_scale} if req.lora_path else None
 
         with self._lock:
             # Reconfigure pipeline for specific request context
             self.pipeline.scheduler = SCHEDULERS[req.scheduler](self.pipeline.scheduler.config)
             self.pipeline.scheduler.set_timesteps(req.steps, device="mps")
-            self._manage_lora(req.lora_path)
 
             # Apply Clip Skip for style control
             original_layers = self.pipeline.text_encoder.config.num_hidden_layers
@@ -98,7 +79,6 @@ class SDXLEngine:
                     num_inference_steps=req.steps,
                     guidance_scale=req.guidance_scale,
                     generator=generator,
-                    cross_attention_kwargs=cross_attention_kwargs,
                 ).images[0]
             finally:
                 # Restore state for the next request in the pool

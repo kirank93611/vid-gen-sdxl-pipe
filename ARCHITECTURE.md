@@ -29,7 +29,6 @@ Owns the SDXL runtime:
 
 - loads the local SDXL model from `./models/sdxl-base`
 - keeps the pipeline in memory
-- swaps LoRA adapters dynamically
 - serializes mutable pipeline access with an internal lock
 - returns image bytes through `io.BytesIO`
 
@@ -73,7 +72,7 @@ flowchart TD
     F -->|Rejected| G["429 capacity_reached"]
     F -->|Accepted| H["run_in_executor"]
     H --> I["SDXLEngine.generate"]
-    I --> J["Scheduler + LoRA Configuration"]
+    I --> J["Scheduler Configuration"]
     J --> K["SDXL Inference on MPS"]
     K --> L["BytesIO -> Base64"]
     L --> M["200 Success Response"]
@@ -91,7 +90,7 @@ flowchart TD
 3. Request body is validated by `GenerateRequest`.
 4. API checks generation capacity via semaphore.
 5. If capacity is available, inference is offloaded to a worker thread.
-6. `engine.generate()` configures scheduler, LoRA, and inference settings.
+6. `engine.generate()` configures scheduler and inference settings.
 7. Output image is encoded in memory and returned as Base64 JSON.
 8. Metrics and request logs are updated.
 
@@ -149,7 +148,6 @@ This prevents a single slow request from holding API capacity forever.
 The engine uses a lock around mutable pipeline operations:
 
 - scheduler changes
-- LoRA load/unload
 - clip-skip related text encoder mutation
 
 This is necessary because the diffusers pipeline is stateful.
@@ -186,7 +184,6 @@ The backend is currently in the “reliable inference service” stage.
 Completed capabilities:
 
 - local SDXL inference
-- LoRA injection
 - validation contracts
 - backpressure
 - timeout handling
