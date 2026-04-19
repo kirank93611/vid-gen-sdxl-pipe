@@ -58,6 +58,30 @@ cd /Users/kiran-giga-se/Desktop/kk/img/image-sd
 source .venv/bin/activate
 ```
 
+## Install Dependencies
+
+If using `uv`, install project dependencies into the active virtual environment first:
+
+```bash
+uv pip install fastapi uvicorn torch diffusers transformers accelerate pydantic pillow huggingface_hub peft httpx
+```
+
+## Download Model Locally
+
+This repository does not track model weights in git. Each collaborator must download the SDXL model locally into `./models/sdxl-base`.
+
+Run:
+
+```bash
+python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='stabilityai/stable-diffusion-xl-base-1.0', local_dir='./models/sdxl-base', allow_patterns=['model_index.json','scheduler/*','tokenizer/*','tokenizer_2/*','text_encoder/config.json','text_encoder/model.fp16.safetensors','text_encoder_2/config.json','text_encoder_2/model.fp16.safetensors','vae/config.json','vae/diffusion_pytorch_model.fp16.safetensors','unet/config.json','unet/diffusion_pytorch_model.fp16.safetensors'])"
+```
+
+If you plan to use LoRA adapters, ensure `peft` is installed:
+
+```bash
+uv pip install peft
+```
+
 ## Start the Server
 
 ```bash
@@ -68,6 +92,12 @@ The API will be available at:
 
 ```text
 http://127.0.0.1:8000
+```
+
+If port `8000` is already in use, start on another port:
+
+```bash
+uvicorn main:app --host 127.0.0.1 --port 8001 --reload
 ```
 
 ## Health Check
@@ -225,3 +255,22 @@ If startup fails because model files are missing, verify these exist:
 ```
 
 If `GET /` returns `404 Not Found`, that is expected. Use `/health`, `/docs`, or `POST /generate`.
+
+If you get:
+
+```text
+Error no file named model_index.json found in directory ./models/sdxl-base
+```
+
+then the local model has not been downloaded yet. Run the model download command from the `Download Model Locally` section.
+
+If you get:
+
+```text
+PEFT backend is required for this method.
+```
+
+then you sent a `lora_path` value but do not have `peft` installed, or the LoRA setup is invalid. Either:
+
+- set `"lora_path": null`
+- or install `peft` and provide a real local `.safetensors` path

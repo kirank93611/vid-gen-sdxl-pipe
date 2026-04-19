@@ -1,88 +1,236 @@
-# SDXL-Lightning API: Architecture & Runbook
+# SDXL API Architecture
 
-## 1. System Architecture (The "Factory" Model)
-This API is designed as a **Headless, Stateless Monolith** optimized for Apple Silicon (MPS). It follows a strict separation of concerns to ensure that the GPU logic never blocks the web server.
+## Overview
 
-### Component Map:
-- **`schemas.py` (The Gatekeeper):** Uses Pydantic to enforce 2026-standard type safety. It prevents "GPU Poisoning" by rejecting invalid image dimensions or step counts before they reach the engine.
-- **`engine.py` (The Powerhouse):** Manages the PyTorch lifecycle. It handles **Multi-Tenancy LoRA swapping** and ensures only one request touches the GPU at a time via a Threading Lock.
-- **`main.py` (The Orchestrator):** A lean FastAPI wrapper that offloads heavy lifting to background threads, keeping the API responsive even during 100% GPU utilization.
+This project is a local-first SDXL image generation API built for Apple Silicon. The system is intentionally structured as a small, testable backend with clear boundaries between:
 
----
+- request validation
+- HTTP orchestration
+- inference execution
+- observability and failure handling
 
-## 2. The Request State Machine
-This diagram tracks the lifecycle of a single image generation request.
+The repository is code-only. Model weights, generated images, caches, and local virtual environments are intentionally excluded from git history.
+
+## Current System Shape
+
+### `schemas.py`
+
+Defines the API contracts:
+
+- `GenerateRequest`
+- `GenerateResponse`
+- `ErrorResponse`
+
+This layer protects the inference engine from invalid input shapes and keeps response/error formats explicit.
+
+### `engine.py`
+
+Owns the SDXL runtime:
+
+- loads the local SDXL model from `./models/sdxl-base`
+- keeps the pipeline in memory
+- swaps LoRA adapters dynamically
+- serializes mutable pipeline access with an internal lock
+- returns image bytes through `io.BytesIO`
+
+This module is the only place that should know about model internals.
+
+### `main.py`
+
+Owns API orchestration:
+
+- FastAPI route definitions
+- request ID middleware
+- metrics collection
+- backpressure control
+- timeout handling
+- global error handling
+- offloading blocking inference with `run_in_executor`
+
+This file should remain focused on transport, policy, and observability rather than model logic.
+
+### `tests/test_integration_api.py`
+
+Runs ASGI-level integration tests with mocked model execution. These tests validate:
+
+- health endpoint behavior
+- success response contract
+- 429 backpressure behavior
+- 500 dev/prod error behavior
+- 504 timeout behavior
+
+This suite is the primary regression safety net for backend contract changes.
+
+## Runtime Flow
 
 ```mermaid
-stateDiagram-v2
-    [*] --> IDLE: Model Loaded in VRAM (MPS)
-    IDLE --> VALIDATING: POST /generate received
-    VALIDATING --> WAITING: Request schema verified
-    WAITING --> CONFIGURING: PIPE_LOCK Acquired
-    CONFIGURING --> LORA_SWAP: New LoRA requested?
-    LORA_SWAP --> INFERENCE: Steps/Scheduler/Seed set
-    INFERENCE --> ENCODING: 4-Step Lightning Loop (MPS)
-    ENCODING --> RELEASE: JPEG -> Base64 (In-Memory)
-    RELEASE --> RESPONDING: PIPE_LOCK Released
-    RESPONDING --> IDLE: JSON returned to Client
+flowchart TD
+    A["Client"] --> B["FastAPI Middleware"]
+    B --> C["Request ID Assigned"]
+    C --> D["Route Handler"]
+    D --> E["Pydantic Validation"]
+    E --> F["Backpressure Check"]
+    F -->|Rejected| G["429 capacity_reached"]
+    F -->|Accepted| H["run_in_executor"]
+    H --> I["SDXLEngine.generate"]
+    I --> J["Scheduler + LoRA Configuration"]
+    J --> K["SDXL Inference on MPS"]
+    K --> L["BytesIO -> Base64"]
+    L --> M["200 Success Response"]
+    H -->|Timeout| N["504 generation_timeout"]
+    D -->|Unhandled error| O["500 internal_error"]
+    B --> P["Metrics + Structured Logs"]
 ```
 
----
+## Request Lifecycle
 
-## 3. Key AI Engineering Optimizations
-1.  **Statelessness:** No images are written to the SSD. This prevents "Disk Thrashing" and keeps the system clean.
-2.  **Unified Memory Management:** By using `torch.float16` and the `MPS` backend, we utilize the M3 Pro's 18GB Unified Memory efficiently without hitting the 12GB "VRAM" limit of standard GPUs.
-3.  **Lightning Distillation:** Defaulted to 4 steps with 1.0 guidance scale. This provides a **10x speedup** over base SDXL while maintaining high quality.
-4.  **Async/Threading Hybrid:** FastAPI handles the network (Async), while a dedicated thread pool handles the GPU (Blocking), ensuring "Non-Blocking IO."
+### Success path
 
----
+1. Client sends `POST /generate`.
+2. Middleware assigns `request_id` and starts timing.
+3. Request body is validated by `GenerateRequest`.
+4. API checks generation capacity via semaphore.
+5. If capacity is available, inference is offloaded to a worker thread.
+6. `engine.generate()` configures scheduler, LoRA, and inference settings.
+7. Output image is encoded in memory and returned as Base64 JSON.
+8. Metrics and request logs are updated.
 
-## 4. Runbook (Operational Guide)
+### Backpressure path
 
-### Prerequisites
-- Python 3.10+
-- macOS (Apple Silicon M1/M2/M3)
-- ~12GB of free Unified Memory
+1. Client sends `POST /generate`.
+2. Capacity check fails immediately.
+3. API returns `429` with `error_code="capacity_reached"`.
+4. Response includes `Retry-After` and `X-Request-ID`.
 
-### Step 1: Environment Setup
+### Timeout path
+
+1. Inference starts in a background thread.
+2. API waits with `asyncio.wait_for(...)`.
+3. If timeout threshold is exceeded, API returns `504` with `error_code="generation_timeout"`.
+4. Inflight counters and semaphore are still released from `finally`.
+
+### Internal error path
+
+1. Unexpected exception occurs during request handling.
+2. Global exception handler returns `500`.
+3. In `dev`, response includes `details`.
+4. In non-`dev`, internal details are hidden.
+
+## Reliability Controls
+
+### Non-blocking I/O
+
+The web server does not run PyTorch inference directly in the event loop. Inference is offloaded with:
+
+- `asyncio.get_running_loop()`
+- `loop.run_in_executor(...)`
+
+This keeps the FastAPI server responsive under blocking GPU work.
+
+### Backpressure
+
+Generation concurrency is explicitly bounded with:
+
+- `MAX_INFLIGHT_GENERATIONS`
+- a semaphore guarding `/generate`
+
+This prevents unbounded pile-up of expensive inference requests.
+
+### Timeout policy
+
+Generation is bounded by:
+
+- `GENERATION_TIMEOUT_SECONDS`
+
+This prevents a single slow request from holding API capacity forever.
+
+### Thread safety
+
+The engine uses a lock around mutable pipeline operations:
+
+- scheduler changes
+- LoRA load/unload
+- clip-skip related text encoder mutation
+
+This is necessary because the diffusers pipeline is stateful.
+
+## Observability
+
+Current observability features:
+
+- `X-Request-ID` on all responses
+- structured log messages with request ID
+- `/metrics` endpoint with request/generation counters
+- explicit counters for:
+  - total requests
+  - inflight requests
+  - accepted/rejected generation requests
+  - timeout count
+  - latency totals and averages
+
+## Repository Rules
+
+These are intentional product and collaboration decisions:
+
+- `models/` is not tracked in git
+- `generated/` is not tracked in git
+- `__pycache__/` is not tracked in git
+- collaborators must fetch model assets separately
+
+Git is used for source, tests, and documentation. Large model binaries are outside repo scope.
+
+## Current Product Stage
+
+The backend is currently in the “reliable inference service” stage.
+
+Completed capabilities:
+
+- local SDXL inference
+- LoRA injection
+- validation contracts
+- backpressure
+- timeout handling
+- typed error responses
+- integration tests
+
+Next planned milestones:
+
+1. API key authentication
+2. per-key rate limiting
+3. persisted generation history
+4. async job model
+5. frontend integration
+
+## How To Work On This Project
+
+### Backend changes
+
+Prefer editing:
+
+- `schemas.py` for API contract changes
+- `main.py` for routing, policy, and metrics
+- `engine.py` for inference/runtime behavior
+
+### Before pushing
+
+Run:
+
 ```bash
-# Create and activate virtual environment
-python -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies (ensure you have the latest diffusers and accelerate)
-pip install fastapi uvicorn torch diffusers transformers accelerate pydantic pillow
+make test-integration
 ```
 
-### Step 2: Model Acquisition (If missing)
-Ensure your `./models/sdxl-base` contains the `fp16` variant of SDXL-Lightning.
-```python
-from huggingface_hub import snapshot_download
-snapshot_download(
-    "ByteDance/SDXL-Lightning", 
-    local_dir="./models/sdxl-base", 
-    allow_patterns=["*fp16*"]
-)
-```
+### When changing contracts
 
-### Step 3: Starting the API
-```bash
-# Run with Uvicorn on all local interfaces
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-```
+If you modify:
 
-### Step 4: Testing the Engine (CURL)
-```bash
-curl -X POST http://127.0.0.1:8000/generate \
--H "Content-Type: application/json" \
--d '{
-  "prompt": "Anime style, a futuristic neon city, high quality, 8k",
-  "steps": 4,
-  "width": 1024,
-  "height": 1024
-}' > response.json
-```
+- error payload shape
+- `/generate` success fields
+- backpressure behavior
+- timeout behavior
+- metrics keys
 
-### Step 5: Monitoring
-- **Memory:** Use `sudo powermetrics --samplers gpu_power` to monitor GPU/Memory pressure.
-- **Logs:** Watch the terminal for `Unloading LoRA` / `Loading LoRA` messages during multi-tenant requests.
+then update:
+
+- integration tests
+- `README.md`
+- this architecture document if the design meaning changed
