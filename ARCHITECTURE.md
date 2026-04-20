@@ -11,9 +11,11 @@ This project is a local-first SDXL image generation API built for Apple Silicon.
 
 The repository is code-only. Model weights, generated images, caches, and local virtual environments are intentionally excluded from git history.
 
+**Companion conventions:** Repo-wide rules for monorepo layout (Next.js + FastAPI), SEO/product boundaries, contract testing, and merge checklists live in `.cursor/rules/` — start with `quality-and-contracts.mdc` and `monorepo-layout.mdc`. This document focuses on the **inference service** runtime; those rules cover full-stack and process expectations.
+
 ## Current System Shape
 
-### `schemas.py`
+### `services/inference-api/schemas.py`
 
 Defines the API contracts:
 
@@ -23,18 +25,18 @@ Defines the API contracts:
 
 This layer protects the inference engine from invalid input shapes and keeps response/error formats explicit.
 
-### `engine.py`
+### `services/inference-api/engine.py`
 
 Owns the SDXL runtime:
 
-- loads the local SDXL model from `./models/sdxl-base`
+- loads the local SDXL model from `<repo root>/models/sdxl-base` (or `SDXL_MODEL_PATH`)
 - keeps the pipeline in memory
 - serializes mutable pipeline access with an internal lock
 - returns image bytes through `io.BytesIO`
 
 This module is the only place that should know about model internals.
 
-### `main.py`
+### `services/inference-api/main.py`
 
 Owns API orchestration:
 
@@ -48,12 +50,13 @@ Owns API orchestration:
 
 This file should remain focused on transport, policy, and observability rather than model logic.
 
-### `tests/test_integration_api.py`
+### `services/inference-api/tests/test_integration_api.py`
 
 Runs ASGI-level integration tests with mocked model execution. These tests validate:
 
 - health endpoint behavior
 - success response contract
+- 401 API key authentication behavior
 - 429 backpressure behavior
 - 500 dev/prod error behavior
 - 504 timeout behavior
@@ -185,6 +188,7 @@ Completed capabilities:
 
 - local SDXL inference
 - validation contracts
+- static API key authentication for `/generate` and `/metrics`
 - backpressure
 - timeout handling
 - typed error responses
@@ -192,11 +196,10 @@ Completed capabilities:
 
 Next planned milestones:
 
-1. API key authentication
-2. per-key rate limiting
-3. persisted generation history
-4. async job model
-5. frontend integration
+1. per-key rate limiting
+2. persisted generation history
+3. async job model
+4. frontend integration
 
 ## How To Work On This Project
 
@@ -204,9 +207,9 @@ Next planned milestones:
 
 Prefer editing:
 
-- `schemas.py` for API contract changes
-- `main.py` for routing, policy, and metrics
-- `engine.py` for inference/runtime behavior
+- `services/inference-api/schemas.py` for API contract changes
+- `services/inference-api/main.py` for routing, policy, and metrics
+- `services/inference-api/engine.py` for inference/runtime behavior
 
 ### Before pushing
 

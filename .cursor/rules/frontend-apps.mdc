@@ -1,0 +1,46 @@
+---
+description: Next.js App Router, SEO, shadcn/ui, and FastAPI integration
+globs: "{apps,packages}/**/*.{tsx,ts,jsx,js,mjs,cjs}"
+alwaysApply: false
+---
+
+# Frontend — Next.js + shadcn (apps & packages)
+
+## Stack (decided)
+
+- **Framework:** Next.js (**App Router**).
+- **UI:** **shadcn/ui** (Radix primitives + Tailwind) — copy components into the repo, customize in place.
+- **Styling:** Tailwind CSS (required for shadcn).
+
+## SEO (marketing & public pages)
+
+- Use the **Metadata API** (`metadata` export or `generateMetadata`) for title, description, Open Graph, canonical URLs.
+- Prefer **server components** for indexable content; keep critical copy and headings in server-rendered HTML (not only inside client-only islands).
+- Mind **Core Web Vitals**: sensible image formats (`next/image`), avoid blocking the main thread on first paint for hero sections.
+- Public routes should have a clear heading hierarchy (`h1` once per page, logical `h2`/`h3`).
+
+## Dashboard / product routes
+
+- Authenticated flows: generation UI, history, settings — SEO is secondary; client components are fine where interactivity dominates.
+- **Never** embed GPU inference in the browser for production; call **FastAPI** (same patterns as `client.py`: JSON + Base64 image).
+
+## Calling the inference API
+
+- Use **`NEXT_PUBLIC_*`** only for **non-secret** values (e.g. public API base URL in dev). Secrets belong in **Route Handlers** (`app/api/.../route.ts`) or server actions that proxy to FastAPI server-side.
+- Forward **`X-Request-ID`** or generate a client correlation id when debugging (optional).
+
+## Structure hints
+
+- Colocate feature UI under `app/(marketing)/`, `app/(dashboard)/` or similar **route groups** to separate layouts without duplicating Next apps.
+- Shared primitives live in `components/ui/` (shadcn) and composables in `components/` — extract duplicates instead of copying between marketing and dashboard.
+
+## Testing (when the web app exists)
+
+- **API client logic:** test parsing of success and **error** payloads (`error_code`, `request_id`) so UI matches FastAPI behavior.
+- **E2E smoke:** one happy path + one failure path (e.g. 429 or timeout) is enough for early MVP; expand as the product stabilizes.
+- Prefer **Playwright** (or equivalent) for browser E2E; keep tests independent of real GPU by mocking at the HTTP boundary or using a dedicated test API when available.
+
+## What not to do
+
+- Do not add FastAPI or Python under `apps/`.
+- Do not ship API keys or admin tokens in `NEXT_PUBLIC_*` env vars.

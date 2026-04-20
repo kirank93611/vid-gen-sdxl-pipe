@@ -1,0 +1,40 @@
+---
+description: Monorepo boundaries — Next.js web vs FastAPI services vs shared packages
+alwaysApply: true
+---
+
+# Monorepo layout (target)
+
+Multi-app monorepo: **one Next.js frontend** (SEO + product) talks to **Python inference** over HTTP. Keep marketing, dashboard UI, and GPU APIs strictly separated.
+
+## Directories (convention)
+
+| Area | Path | Owns |
+|------|------|------|
+| **Web (Next.js)** | `apps/web/` (recommended) | App Router, **SEO** marketing pages, dashboard/product routes, **shadcn/ui** + Tailwind. No Python, no direct torch. |
+| **Inference API** | `services/inference-api/` | FastAPI, SDXL `engine`, metrics, GPU — **no** React |
+| **Shared** | `packages/shared/` (optional) | OpenAPI-generated types, shared constants — **no** heavy UI |
+
+**Lean MVP default:** a **single** Next app (`apps/web`) with route groups, e.g. public routes for SEO and `/dashboard` (or `(app)/`) for authenticated UI. Split into `apps/landing` + `apps/dashboard` only if you need **separate deploys** or teams.
+
+## Rules of separation
+
+1. **SEO / marketing** lives in Next.js server components or SSG/ISR pages with proper metadata — not in FastAPI templates.
+2. **Dashboard** calls the inference API via HTTP (`fetch` from server components/route handlers or client with `NEXT_PUBLIC_*` base URL). Never run SDXL in the browser for production.
+3. **Backend services** stay **one deployable per service** (own `Dockerfile`, env, scaling). Do not merge inference with unrelated domains without an explicit decision.
+4. **Python inference** stays out of `apps/*`. Do not add FastAPI inside the Next.js tree.
+
+## API contracts
+
+- JSON shapes live in FastAPI (`services/inference-api/schemas.py`); optionally generate TypeScript types from OpenAPI into `packages/shared/` or `apps/web/lib/api-types`.
+- Changing `/generate` or error payloads is a **contract change** — update Python integration tests **and** the Next.js client code.
+
+## Related documentation
+
+- **Backend runtime and flows:** `ARCHITECTURE.md` (request lifecycle, reliability, observability).
+- **Quality bar and contract testing:** `.cursor/rules/quality-and-contracts.mdc`.
+
+## Current state
+
+- **Inference API** lives in **`services/inference-api/`** (run via `make run` from repo root).
+- **`apps/web/`** is reserved for the Next.js app (placeholder README until scaffolded). Do not add a second ad-hoc frontend at the repository root.

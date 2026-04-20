@@ -1,0 +1,37 @@
+---
+description: Contract testing, docs sync, and product-quality bar (architect + SDET + PM)
+alwaysApply: true
+---
+
+# Quality, contracts, and product bar
+
+Use this as the **definition of done** when changing APIs, UI, or reliability. It complements `ARCHITECTURE.md` (backend deep dive) and `.cursor/rules/*` (stack conventions).
+
+## Source of truth (Staff Architect)
+
+- **HTTP JSON contract** is owned by **FastAPI** (`services/inference-api/schemas.py` + route behavior). Treat **`GET /openapi.json`** (or exported OpenAPI) as the machine-readable contract for TypeScript clients and codegen.
+- **Next.js** owns **SEO, layout, and UX** — not the inference JSON schema. Do not duplicate request/field definitions only in the frontend; generate or mirror types from OpenAPI when `apps/web` exists.
+
+## Testing pyramid (Staff SDET)
+
+| Layer | What | When |
+|-------|------|------|
+| **Integration (Python)** | `services/inference-api/tests/test_integration_api.py` — ASGI, mocked GPU | **Required** on every change to `/generate`, `/health`, `/metrics`, status codes, or error body shape |
+| **Contract** | Compare OpenAPI snapshot or golden JSON fixtures | Optional but recommended before v1 public API |
+| **E2E (future)** | Playwright (or similar) against Next + API | Add for **smoke** paths once `apps/web` exists (e.g. load page → trigger generate → see result or error) |
+
+- **Regression rule:** Any change that updates `test_integration_api.py` expectations must also update **`README.md`** (user-facing API) and **`ARCHITECTURE.md`** if the **design meaning** of the flow changes (not for typo-only edits).
+- **Flakes:** Backpressure and timeout tests depend on timing; keep sleeps conservative and avoid machine-load assumptions in CI.
+
+## Product / PM alignment
+
+- **Stable `error_code` values** (`capacity_reached`, `generation_timeout`, `internal_error`, …) are part of the **product surface** — UI copy and support docs may depend on them. Renaming or removing codes is a **breaking change**; prefer additive codes and a short changelog or release note for external users.
+- **`X-Request-ID`**: Preserve for support and analytics correlation; frontends should surface or log it on user-reported failures.
+- **MVP scope:** Defer auth, billing, and async job queues until explicitly prioritized; rules in `monorepo-layout.mdc` stay valid when those land as **separate services or routes**.
+
+## Cross-stack checklist (before merge)
+
+1. `make test-integration` (or equivalent) **green**
+2. README API examples still accurate
+3. If Next client exists: types or fetch layer updated; CORS or Route Handler proxy still valid
+4. Metrics keys unchanged or **intentionally** versioned with dashboards updated
