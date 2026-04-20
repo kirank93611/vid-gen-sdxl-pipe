@@ -2,6 +2,37 @@
 
 Local FastAPI service for SDXL image generation on Apple Silicon using MPS.
 
+## Repository layout
+
+| Path | Purpose |
+|------|---------|
+| `services/inference-api/` | FastAPI app: `main.py`, `engine.py`, `schemas.py`, `tests/` |
+| `apps/web/` | Next.js frontend (placeholder — see `apps/web/README.md`) |
+| `packages/` | Optional shared TS/types or constants (see `packages/README.md`) |
+| `.cursor/rules/` | Cursor project rules (monorepo, Python, quality bar) |
+| `models/` | Local SDXL weights (gitignored) at `models/sdxl-base` |
+
+### Source tree (application + docs)
+
+Only **source and docs** — not `.venv`, `models/`, or `__pycache__`:
+
+```text
+image-sd/
+├── .cursor/rules/          # Cursor *.mdc rules
+├── apps/web/README.md      # Next.js placeholder
+├── packages/README.md      # optional shared packages
+├── services/inference-api/
+│   ├── client.py
+│   ├── engine.py
+│   ├── main.py
+│   ├── schemas.py
+│   └── tests/
+│       └── test_integration_api.py
+├── ARCHITECTURE.md
+├── Makefile
+└── README.md
+```
+
 ## Collaboration Notes
 
 This repository is intentionally code-only for collaboration.
@@ -12,8 +43,8 @@ This repository is intentionally code-only for collaboration.
 
 ### Working Agreement
 
-- Backend contract lives in `main.py`, `schemas.py`, and integration tests
-- Inference implementation lives in `engine.py`
+- Backend contract lives in `services/inference-api/main.py`, `schemas.py`, and integration tests
+- Inference implementation lives in `services/inference-api/engine.py`
 - Large model files stay out of git history
 - Product changes should preserve the current error and metrics contracts unless intentionally versioned
 
@@ -74,28 +105,32 @@ python -c "from huggingface_hub import snapshot_download; snapshot_download(repo
 
 ## Start the Server
 
+From the repository root:
+
 ```bash
-uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+make run
+```
+
+Or manually (from `services/inference-api/`):
+
+```bash
+cd services/inference-api && source ../../.venv/bin/activate && uvicorn main:app --host 127.0.0.1 --port 8001 --reload
 ```
 
 The API will be available at:
 
 ```text
-http://127.0.0.1:8000
+http://127.0.0.1:8001
 ```
 
-If port `8000` is already in use, start on another port:
-
-```bash
-uvicorn main:app --host 127.0.0.1 --port 8001 --reload
-```
+(`make run` uses port **8001** by default; use another port if it is already in use, e.g. `PORT=8000 make run`.)
 
 ## Health Check
 
 Use this to confirm the engine is loaded:
 
 ```bash
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8001/health
 ```
 
 Expected response:
@@ -109,7 +144,7 @@ Expected response:
 Use this to inspect basic runtime counters and generation latency:
 
 ```bash
-curl http://127.0.0.1:8000/metrics
+curl http://127.0.0.1:8001/metrics -H "X-API-Key: dev-local-key"
 ```
 
 ## Backpressure Behavior
@@ -119,11 +154,13 @@ When `MAX_INFLIGHT_GENERATIONS` is reached, new `/generate` requests should retu
 Run two generation requests in parallel:
 
 ```bash
-curl -s -X POST "http://127.0.0.1:8000/generate" \
+curl -s -X POST "http://127.0.0.1:8001/generate" \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-local-key" \
   -d '{"prompt":"request one"}' >/tmp/r1.json &
-curl -s -X POST "http://127.0.0.1:8000/generate" \
+curl -s -X POST "http://127.0.0.1:8001/generate" \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-local-key" \
   -d '{"prompt":"request two"}' >/tmp/r2.json &
 wait
 cat /tmp/r1.json
@@ -133,7 +170,7 @@ cat /tmp/r2.json
 Then verify rejection counters:
 
 ```bash
-curl -s http://127.0.0.1:8000/metrics
+curl -s http://127.0.0.1:8001/metrics -H "X-API-Key: dev-local-key"
 ```
 
 Look for:
@@ -146,8 +183,9 @@ Look for:
 The `/generate` endpoint returns a JSON response with a Base64-encoded image.
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/generate" \
+curl -X POST "http://127.0.0.1:8001/generate" \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-local-key" \
   -d '{
     "prompt":"a cinematic portrait of a tiger in rain, ultra detailed",
     "width":1024,
@@ -160,6 +198,12 @@ curl -X POST "http://127.0.0.1:8000/generate" \
 ```
 
 Each response also includes an `X-Request-ID` header for tracing.
+
+## API key authentication
+
+- `/generate` and `/metrics` require header `X-API-Key`.
+- Default key for local development is `dev-local-key`.
+- Override with env var `SDXL_API_KEY` before `make run`.
 
 ## Request Fields
 
@@ -180,7 +224,7 @@ Because the API returns Base64, use the helper client or decode the response you
 Run the sample client:
 
 ```bash
-python client.py
+cd services/inference-api && source ../../.venv/bin/activate && python client.py
 ```
 
 Or decode manually in Python:
@@ -191,7 +235,8 @@ import requests
 import base64
 
 response = requests.post(
-    "http://127.0.0.1:8000/generate",
+    "http://127.0.0.1:8001/generate",
+    headers={"X-API-Key": "dev-local-key"},
     json={"prompt": "a cinematic portrait of a tiger in rain"}
 )
 response.raise_for_status()
@@ -209,7 +254,7 @@ PY
 Interactive Swagger UI:
 
 ```text
-http://127.0.0.1:8000/docs
+http://127.0.0.1:8001/docs
 ```
 
 ## Integration Tests
@@ -217,16 +262,21 @@ http://127.0.0.1:8000/docs
 Run the full integration suite:
 
 ```bash
-cd /Users/kiran-giga-se/Desktop/kk/img/image-sd
-source .venv/bin/activate
-python -m unittest discover -s tests -p 'test_*.py' -v
+cd /path/to/image-sd
+make test-integration
+```
+
+Or:
+
+```bash
+cd services/inference-api && source ../../.venv/bin/activate && python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 The tests use ASGI integration calls with mocked model loading/generation so they validate API behavior without GPU-heavy startup.
 
 ## Model Notes
 
-- The service loads the local model from `./models/sdxl-base`
+- The service loads weights from **`<repository root>/models/sdxl-base`** by default. Override with env **`SDXL_MODEL_PATH`** if you store models elsewhere.
 - Loading is offline-only; it does not download model files at runtime
 - The code uses fp16 safetensors on MPS
 

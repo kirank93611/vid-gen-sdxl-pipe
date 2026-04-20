@@ -6,10 +6,20 @@ import time
 import uuid
 import threading
 import logging
+from pathlib import Path
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from schemas import GenerateRequest, GenerateResponse, ErrorResponse
 from engine import SDXLEngine
+
+
+# Repo root: .../image-sd (models live at <repo>/models/sdxl-base)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_MODEL = _REPO_ROOT / "models" / "sdxl-base"
+RATE_LIMIT_REQUESTS = 5
+RATE_LIMIT_WINDOW_SECONDS = 60
+
 
 # --- Modern API Initialization ---
 app = FastAPI(
@@ -19,14 +29,24 @@ app = FastAPI(
 
 # Shared global engine instance
 # Initialized at startup for Apple Silicon memory stability
-engine = SDXLEngine(model_path="./models/sdxl-base")
+engine = SDXLEngine(model_path=os.environ.get("SDXL_MODEL_PATH", str(_DEFAULT_MODEL)))
 logger = logging.getLogger("sdxl_api")
 
 
 class RequestIdFilter(logging.Filter):
+    """
+    Logging filter that guarantees `request_id` exists on every log record.
+
+    Why this exists:
+    - Our logging formatter expects `%(request_id)s`.
+    - Third-party logs (or logs outside middleware context) may not set it.
+    - Without this filter, formatting can raise KeyError.
+    """
     def filter(self, record: logging.LogRecord) -> bool:
+        # If request_id was not injected by middleware, add a safe fallback.
         if not hasattr(record, "request_id"):
             record.request_id = "-"
+        # Returning True tells logging to emit the record.
         return True
 
 
@@ -38,6 +58,8 @@ for handler in logging.getLogger().handlers:
     handler.addFilter(RequestIdFilter())
 
 APP_ENV = os.getenv("APP_ENV", "dev").lower()
+API_KEY_HEADER = "X-API-Key"
+EXPECTED_API_KEY = os.getenv("SDXL_API_KEY", "dev-local-key")
 
 _metrics_lock = threading.Lock()
 
@@ -54,9 +76,9 @@ _metrics: dict[str, int | float] = {
     "generate_success_total": 0,
     "generate_error_total": 0,
     "generate_latency_ms_total": 0.0,
-    "generate_inflight":0,
-    "generate_rejected_total":0,
-    "generate_accepted_total":0,
+    "generate_inflight": 0,
+    "generate_rejected_total": 0,
+    "generate_accepted_total": 0,
     "generate_timeout_total": 0,
 }
 
@@ -67,6 +89,29 @@ def _log_info(message: str, request_id: str) -> None:
 
 def _log_error(message: str, request_id: str) -> None:
     logger.error(message, extra={"request_id": request_id})
+
+
+def _auth_error_response(request_id: str) -> JSONResponse:
+    response = JSONResponse(
+        status_code=401,
+        content={
+            "status": "error",
+            "error_code": "unauthorized",
+            "message": "Invalid or missing API key",
+            "request_id": request_id,
+        },
+    )
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+def _require_api_key(http_request: Request) -> JSONResponse | None:
+    request_id = getattr(http_request.state, "request_id", "unknown")
+    provided_api_key = http_request.headers.get(API_KEY_HEADER)
+    if provided_api_key != EXPECTED_API_KEY:
+        _log_error("request rejected reason=invalid_api_key", request_id)
+        return _auth_error_response(request_id)
+    return None
 
 
 @app.middleware("http")
@@ -135,6 +180,42 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
     Primary inference endpoint.
     Uses asyncio.run_in_executor to offload PyTorch to background threads.
     """
+    unauthorized = _require_api_key(http_request)
+    if unauthorized is not None:
+        return unauthorized
+
+    # ------------------------------------------------------------
+    # Rate-limit gate (per API key, sliding time window)
+    # ------------------------------------------------------------
+    # Why this is here:
+    # - Auth tells us WHO is calling.
+    # - Rate limiting controls HOW OFTEN they can call.
+    # - We do this before expensive GPU work to fail fast and protect capacity.
+    #
+    # Behavior:
+    # - If key exceeded allowed requests in the window:
+    #     -> return HTTP 429
+    #     -> error_code="rate_limited"
+    #     -> include Retry-After header
+    # - Otherwise continue normal generation flow.
+    request_id = getattr(http_request.state, "request_id", "unknown")
+    provided_api_key = http_request.headers.get(API_KEY_HEADER, "")
+
+    if not _check_and_record_rate_limit(provided_api_key):
+        _log_error("POST /generate rejected reason=rate_limited", request_id)
+        response = JSONResponse(
+            status_code=429,
+            content={
+                "status":"error",
+                "error_code":"rate_limited",
+                "message":"Rate limit exceeded",
+                "request_id":request_id,
+            },
+        )
+        response.headers["Retry-After"] = str(RATE_LIMIT_WINDOW_SECONDS)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
     loop = asyncio.get_running_loop()
 
     # 1. Count every attempt first
@@ -142,6 +223,7 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
         _metrics["generate_requests_total"] += 1
 
     # 2. Capacity gate
+    # Capacity gate controls concurrent in-flight work (different from per-key rate limiting).
     acquired = _generate_semaphore.acquire(blocking=False)
     if not acquired:
         with _metrics_lock:
@@ -223,8 +305,14 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
         }
     )
 
-@app.get("/metrics")
-async def metrics() -> dict[str, int | float]:
+@app.get("/metrics", response_model=None)
+async def metrics(http_request: Request) -> dict[str, int | float] | JSONResponse:
+    unauthorized = _require_api_key(http_request)
+    if unauthorized is not None:
+        return unauthorized
+
+        
+
     with _metrics_lock:
         generate_accepted_total = int(_metrics["generate_accepted_total"])
         avg_generate_latency_ms = (
@@ -257,3 +345,129 @@ async def health_check() -> dict[str, str]:
         "backend": "diffusers",
         "optimization": "lightning"
     }
+
+from collections import deque
+from dataclasses import dataclass
+import time
+
+@dataclass
+class KeyRateState:
+    """
+    Per-API-key rate limit state.
+
+    Attributes:
+        request_timestamps:
+            A deque storing timestamps of recent requests.
+            The deque is maintained in chronological order.
+
+    Invariant:
+        All timestamps in this deque are within the active
+        rate limit window after cleanup.
+    """
+    # Ordered timestamps (oldest on the left, newest on the right).
+    # We pop from the left when entries age out of the time window.
+    request_timestamps: deque[float]
+
+# Global synchronization primitive protecting shared rate limit state.
+# Ensures correctness under concurrent request handling.
+_rate_limit_lock = threading.Lock()
+
+# In-memory storage mapping API keys to their rate limit state.
+#
+# Example:
+#
+# {
+#     "key1": KeyRateState([...timestamps...]),
+#     "key2": KeyRateState([...timestamps...])
+# }
+#
+# Lifetime:
+# - Exists for the duration of the process
+# - Cleared on service restart
+_rate_limit_by_key: dict[str, KeyRateState] = {}
+
+def _check_and_record_rate_limit(api_key: str) -> bool:
+    """
+    Check whether a request is allowed under the configured rate limit
+    and record the request timestamp if allowed.
+
+    This function performs three operations atomically:
+    1) Removes timestamps outside the sliding window
+    2) Evaluates current request count
+    3) Records the new request if permitted
+
+    Args:
+        api_key:
+            The API key associated with the incoming request.
+
+    Returns:
+        bool:
+            True  -> request is allowed
+            False -> rate limit exceeded
+
+    Thread Safety:
+        Protected by a global lock to prevent race conditions
+        when multiple requests for the same key arrive concurrently.
+
+    Time Complexity:
+        O(k) where k is number of requests in the current window.
+        Typically small due to bounded request rate.
+
+    Failure Mode:
+        If the limit is exceeded, the caller should return:
+            HTTP 429
+            error_code="rate_limited"
+    """
+
+    # Use monotonic clock to avoid issues if system time changes.
+    # This guarantees timestamps always move forward.
+    now =time.monotonic()
+
+    # Critical section:
+    # Protect shared dictionary and per-key state.
+    with _rate_limit_lock:
+
+        # Initialize state for new API key.
+        if api_key not in _rate_limit_by_key:
+            _rate_limit_by_key[api_key] = KeyRateState(request_timestamps=deque())
+
+        state = _rate_limit_by_key[api_key]
+
+        # Determine start of the active rate limit window.
+        window_start = now - RATE_LIMIT_WINDOW_SECONDS
+
+        # ------------------------------------------------------------------
+        # Cleanup Phase
+        # ------------------------------------------------------------------
+        # Remove timestamps that fall outside the current window.
+        # Because deque is ordered, we only check from the left.
+        #
+        # Example:
+        # window = last 60 seconds
+        #
+        # Before:
+        # [t-120, t-90, t-10]
+        #
+        # After cleanup:
+        # [t-10]
+        # ------------------------------------------------------------------
+        while state.request_timestamps and state.request_timestamps[0] < window_start:
+            state.request_timestamps.popleft()
+            
+        # ------------------------------------------------------------------
+        # Limit Check
+        # ------------------------------------------------------------------
+        # If the number of remaining timestamps equals or exceeds
+        # the configured request limit, reject the request.
+        # ------------------------------------------------------------------
+        if len(state.request_timestamps) >= RATE_LIMIT_REQUESTS:
+            return False
+        
+        # ------------------------------------------------------------------
+        # Record Request
+        # ------------------------------------------------------------------
+        # Append current timestamp to track this request.
+        # ------------------------------------------------------------------
+        state.request_timestamps.append(now)
+
+        return True

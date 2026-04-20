@@ -22,15 +22,31 @@ class SDXLEngine:
     """
     Stateful engine for SDXL-Lightning inference.
     Handles MPS device management and request-scoped pipeline mutation.
+
+    Architecture intent:
+    - Keep all model/runtime concerns here (diffusers, scheduler, MPS).
+    - Keep API concerns out of this class (no FastAPI Request/Response).
+    - Expose a small surface: load model once, generate per request.
     """
     def __init__(self, model_path: str) -> None:
+        # Local filesystem path to SDXL weights (no runtime downloading).
         self.model_path = model_path
+        # Diffusers pipeline object; initialized in load_model().
         self.pipeline: StableDiffusionXLPipeline | None = None
+        # Protects mutable pipeline state during concurrent requests.
         self._lock = threading.Lock()
+        # Eager load at process startup so first request is not delayed.
         self.load_model()
 
     def load_model(self) -> None:
-        """Initializes the pipeline on Apple Silicon (MPS)."""
+        """
+        Initialize the SDXL pipeline on Apple Silicon (MPS).
+
+        Side effects:
+        - Sets offline Hugging Face env flags.
+        - Allocates model weights on MPS device.
+        - Sets a default scheduler.
+        """
         print(f"Loading SDXL-Lightning from {self.model_path}")
         
         # Enforce offline mode to prevent network hangs during inference
@@ -51,13 +67,23 @@ class SDXLEngine:
 
     def generate(self, req: GenerateRequest) -> tuple[bytes, int]:
         """
-        Executes inference on MPS.
-        Returns (raw_image_bytes, used_seed).
+        Execute one image generation request on MPS.
+
+        Args:
+            req: Validated generation request from API schema.
+
+        Returns:
+            Tuple of:
+            - raw JPEG bytes
+            - seed used for deterministic reproducibility
         """
+        # Guardrail: only allow known scheduler keys.
         if req.scheduler not in SCHEDULERS:
             raise ValueError(f"Unsupported scheduler: {req.scheduler}")
 
+        # If caller did not provide a seed, create a random one.
         seed = req.seed if req.seed is not None else torch.randint(0, 2**32 - 1, (1,)).item()
+        # Torch generator tied to MPS device for deterministic sampling.
         generator = torch.Generator(device="mps").manual_seed(seed)
 
         with self._lock:
@@ -87,4 +113,5 @@ class SDXLEngine:
         # Buffer conversion for stateless response
         buffer = io.BytesIO()
         output.save(buffer, format="JPEG", quality=90)
+        # Return bytes instead of file paths to keep API stateless.
         return buffer.getvalue(), seed

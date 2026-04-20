@@ -1,0 +1,37 @@
+---
+description: FastAPI + SDXL engine patterns for the inference API
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# Inference API (Python)
+
+## Layering
+
+- **`services/inference-api/schemas.py`**: Pydantic models only — API contracts, no torch/diffusers imports.
+- **`services/inference-api/engine.py`**: `SDXLEngine`, diffusers, MPS — **no** FastAPI `Request`/`Response` here.
+- **`services/inference-api/main.py`**: Routes, middleware, metrics, executor offload, timeouts — **no** raw pipeline calls except via `engine`.
+
+## Async and GPU
+
+- Never run `pipeline()` on the asyncio event loop; use `run_in_executor` (or a dedicated worker queue) for blocking inference.
+- Timeouts (`asyncio.wait_for`) **do not cancel** the underlying thread’s GPU work — document this for operators; mitigations include process isolation or a job queue.
+
+## OpenAPI (contract consumers)
+
+- FastAPI exposes **`/openapi.json`** — use it for TS codegen or manual sync when the Next app consumes this API.
+- Prefer **Pydantic models** as the single source for request/response fields; avoid duplicating field lists only in frontend code.
+
+## Observability
+
+- Preserve `X-Request-ID` and metrics keys consumed by tests (`generate_*`, `requests_*`).
+- Changing status codes (429/500/504) or error JSON shape is a **contract change** — update `services/inference-api/tests/test_integration_api.py`, `README.md`, and see `quality-and-contracts.mdc` for the full checklist.
+
+## Config
+
+- Prefer env vars (`APP_ENV`, paths, ports) over hardcoding; keep `client.py` default URL aligned with `make run` / docs.
+
+## Next.js (CORS)
+
+- When the **Next.js** app (`apps/web`) calls this API from the browser, configure **CORS** on FastAPI for the web origin(s) in dev/prod, or call FastAPI only from **Next Route Handlers** (same-origin to Next, server-to-server to Python) to avoid exposing the inference URL.
+- Do not serve HTML or SEO pages from this service — that belongs in Next.js.

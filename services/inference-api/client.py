@@ -6,6 +6,7 @@ import requests
 
 
 API_URL = os.getenv("SDXL_API_URL", "http://127.0.0.1:8001/generate")
+API_KEY = os.getenv("SDXL_API_KEY", "dev-local-key")
 OUTPUT_PATH = Path(os.getenv("SDXL_OUTPUT_PATH", "test_output.jpg"))
 
 
@@ -14,7 +15,12 @@ def main() -> None:
         "prompt": "cinematic portrait of a tiger in rain",
     }
 
-    response = requests.post(API_URL, json=payload, timeout=120)
+    response = requests.post(
+        API_URL,
+        json=payload,
+        headers={"X-API-Key": API_KEY},
+        timeout=120,
+    )
     response.raise_for_status()
 
     data = response.json()
