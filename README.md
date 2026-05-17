@@ -10,7 +10,7 @@ Monorepo for **local SDXL image generation** on Apple Silicon (MPS) and a **Next
 |------|---------|
 | `services/inference-api/` | FastAPI: `main.py`, `engine.py`, `router.py`, `schemas.py`, `tests/` |
 | `apps/web/` | Next.js App Router UI + `POST /api/generate` proxy |
-| `packages/` | Optional shared TS types / constants (see `packages/README.md`) |
+| `packages/` | Optional shared TS types / constants (empty until needed) |
 | `.cursor/rules/` | Cursor project rules (monorepo, Python, quality bar) |
 | `models/` | Local SDXL weights (**gitignored**) at `models/sdxl-base` |
 
@@ -23,7 +23,7 @@ image-sd/
 │   ├── src/app/              # pages + api/generate route
 │   ├── src/components/       # generate form
 │   └── .env.example
-├── packages/README.md
+├── packages/                 # optional shared TS (empty)
 ├── services/inference-api/
 │   ├── client.py
 │   ├── engine.py
@@ -250,11 +250,18 @@ Runs `test_integration_api.py` and `test_router.py` with **mocked** GPU work.
 
 ## Web app (`apps/web`)
 
-See [apps/web/README.md](./apps/web/README.md). Summary:
+From repo root, in a second terminal:
 
-- `npm run dev` → `http://localhost:3000`
-- Server route `src/app/api/generate/route.ts` proxies to `SDXL_API_URL`
-- Client component `src/components/generate-form.tsx`
+```bash
+cd apps/web
+cp .env.example .env.local
+npm install
+npm run dev
+```
+
+- UI: `http://localhost:3000`
+- Server route `src/app/api/generate/route.ts` proxies to `SDXL_API_URL` with `X-API-Key` from env
+- Client: `src/components/generate-form.tsx` — extend the POST body with `quality_tier` when you want tiered generation
 
 ## Collaboration notes
 
