@@ -194,12 +194,170 @@ Completed capabilities:
 - typed error responses
 - integration tests
 
+Completed since initial milestone list:
+
+- per-key rate limiting
+- `quality_tier` routing (`router.py`) with metadata (`model_id`, effective steps/CFG)
+- Next.js web app with Route Handler proxy (`apps/web`)
+
 Next planned milestones:
 
-1. per-key rate limiting
-2. persisted generation history
-3. async job model
-4. frontend integration
+1. integration test for `quality_tier` end-to-end
+2. lazy-loaded engine manager (one active model in RAM)
+3. async job API (`POST /jobs`, `GET /jobs/{id}`) for multi-step flows
+4. orchestration layer (agent/planner above inference; tool calls into engines)
+5. production deploy on GPU cloud (e.g. Spheron) with CUDA backend abstraction
+
+## End-to-end architecture (current vs target)
+
+### Today (M3 Pro MVP — synchronous)
+
+```mermaid
+flowchart TB
+    subgraph Client
+        U[User / Browser]
+        WEB[Next.js apps/web]
+    end
+
+    subgraph Edge
+        RH[Route Handler POST /api/generate]
+    end
+
+    subgraph Inference["services/inference-api"]
+        MW[Middleware: X-Request-ID + metrics]
+        AUTH[API key + rate limit]
+        VAL[Pydantic GenerateRequest]
+        RT[router.apply_quality_tier]
+        BP[Semaphore: MAX_INFLIGHT=1]
+        EX[run_in_executor]
+        ENG[SDXLEngine singleton]
+        MPS[PyTorch diffusers on MPS]
+    end
+
+    subgraph Local["MacBook M3 Pro"]
+        RAM[(Unified memory)]
+        WEIGHTS[(models/sdxl-base on disk)]
+    end
+
+    U --> WEB
+    WEB --> RH
+    RH -->|HTTP + X-API-Key server-side| MW
+    MW --> AUTH --> VAL --> RT --> BP
+    BP -->|accepted| EX --> ENG
+    ENG --> MPS
+    MPS --> RAM
+    ENG -.->|load at startup| WEIGHTS
+    MPS -->|JPEG base64 JSON| WEB
+```
+
+### Target (M3 Pro learning path → Spheron-ready)
+
+```mermaid
+flowchart TB
+    subgraph Client
+        U[User]
+        WEB[Next.js]
+    end
+
+    subgraph Orchestration["Future: agent / planner (not in repo yet)"]
+        PLAN[Planner: decompose prompt]
+        POL[Policy: pick model + pipeline steps]
+    end
+
+    subgraph API["FastAPI inference-api"]
+        SYNC[POST /generate sync — keep for simple calls]
+        JOBS[POST /jobs async — multi-step / long runs]
+        Q[Job queue + worker loop]
+        ADM[RAM / inflight admission]
+        REG[Engine registry]
+        RT[quality_tier + model_id router]
+    end
+
+    subgraph Engines["Lazy-loaded engines (one hot at a time on Mac)"]
+        E1[sdxl_base]
+        E2[sdxl_lightning / future]
+        E3[flux / inpaint — future]
+    end
+
+    subgraph Runtime
+        MAC[M3 Pro: MPS + local weights]
+        CLOUD[Spheron: CUDA GPU VM + object storage for weights]
+    end
+
+    U --> WEB --> API
+    PLAN --> POL
+    POL -->|tool: generate / inpaint / segment| JOBS
+    POL -->|single-shot| SYNC
+    JOBS --> Q --> ADM --> REG
+    SYNC --> ADM --> REG
+    RT --> REG
+    REG -->|load on demand; unload previous| E1
+    REG --> E2
+    REG --> E3
+    E1 --> MAC
+    E2 --> MAC
+    E1 --> CLOUD
+    E2 --> CLOUD
+```
+
+### Request lifecycle (target async + lazy load)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as FastAPI
+    participant Q as Job queue
+    participant W as Worker
+    participant R as Engine registry
+    participant G as GPU engine
+
+    C->>API: POST /jobs {prompt, quality_tier, plan?}
+    API->>API: auth, validate, enqueue
+    API-->>C: 202 {job_id, status: queued}
+
+    W->>Q: claim next job
+    W->>W: check RAM / inflight policy
+    alt need different model
+        W->>R: unload current / load model_id
+        R->>G: load weights from disk or volume
+    end
+    W->>G: generate(effective_request)
+  G-->>W: image bytes + metadata
+    W->>Q: status succeeded + artifact ref
+
+    C->>API: GET /jobs/{job_id}
+    API-->>C: status + image_base64 or URL
+```
+
+## Tech debt (explicit)
+
+| Area | What we have now | Debt if we rush multi-model / agents | Mitigation (do early) |
+|------|------------------|--------------------------------------|------------------------|
+| **Device** | Hard-coded `mps` in `engine.py` | Spheron uses **CUDA**; code paths diverge | `DEVICE` env (`mps` / `cuda` / `cpu`); single factory |
+| **Model loading** | **Eager** singleton at import/startup | OOM if multiple pipelines; slow cold switch | `EngineRegistry` with `load(model_id)` / `unload()`; max one resident on Mac |
+| **Routing** | `quality_tier` → steps/CFG only; always `sdxl_base` weights | “fast tier” without Lightning weights is misleading | Separate `model_id` from tier; honest 503 if weights missing |
+| **API shape** | Sync `POST /generate` only | Long agent chains hit **timeouts** (90s) | Add **jobs** contract; keep `/generate` for single step |
+| **Orchestration** | None (client → API) | Agent logic inside `main.py` | New module `orchestrator/` or external service; **tools** call inference API |
+| **Artifacts** | Base64 in JSON | Huge payloads; bad for multi-step | Job result: file URL / object storage key on cloud |
+| **Metrics** | Global counters | Cannot compare models/tiers | Label metrics by `model_id`, `quality_tier`, job status |
+| **Health** | `optimization: lightning` vs **base** weights on disk | Ops confusion | Health reports `model_id`, `device`, `loaded_models` |
+| **Deploy** | `make run` on laptop | No image, no GPU provider config | Dockerfile + `DEVICE=cuda` + model volume; Spheron deploy API for VM |
+| **Tests** | Mocked engine | Registry/lazy load untested | Unit tests for router + registry; job state machine tests |
+
+## MacBook M3 Pro (MVP) vs Spheron (production)
+
+| Dimension | M3 Pro now | Spheron / GPU cloud later |
+|-----------|------------|---------------------------|
+| **Accelerator** | Apple **MPS** (unified memory) | NVIDIA **CUDA** (dedicated VRAM) |
+| **Memory** | RAM shared with OS; easy **OOM** / swap | VRAM sized per instance (e.g. 24–80 GB); still need one-model discipline at first |
+| **Concurrency** | Practically **1** heavy generation | Can raise inflight with bigger GPU; still queue for fairness |
+| **Model storage** | `models/sdxl-base` local path | Download to volume on boot or pull from S3/R2; bake into image only if size acceptable |
+| **Latency** | Cold MPS warmup; 20–60s+ for quality tiers | Often faster per step; pay for GPU minute |
+| **Cost model** | CapEx (your machine) | Per-minute GPU; **lazy load** saves $ if instances stay up |
+| **Agents** | Can run **locally** (small LLM) calling localhost API | Planner on CPU instance; inference on GPU instance (split services) |
+| **Spheron fit** | N/A | Rent GPU VM, SSH or API deploy; optional Triton for multi-model serving at scale |
+
+**Portable design rule:** keep **HTTP JSON contract** (`GenerateRequest`, `ErrorResponse`, job schemas) stable; swap **engine backend** and **storage** via env, not forks of `main.py`.
 
 ## How To Work On This Project
 

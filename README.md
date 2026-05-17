@@ -212,8 +212,9 @@ Each response also includes an `X-Request-ID` header for tracing.
 - `seed`: optional manual seed
 - `width`: image width, `512` to `1536`, multiple of `8`
 - `height`: image height, `512` to `1536`, multiple of `8`
-- `steps`: default `4`, allowed `1` to `8`
-- `guidance_scale`: default `1.0`, allowed `0.0` to `2.0`
+- `steps`: default `4`, allowed `1` to `40`
+- `guidance_scale`: default `1.0`, allowed `0.0` to `12.0`
+- `quality_tier`: optional `fast`, `balanced`, or `quality`. When set, the server chooses `steps` and `guidance_scale` from the tier table in `services/inference-api/router.py` (current backend: `sdxl_base` only).
 - `clip_skip`: default `2`
 - `scheduler`: `dpm++2m_karras` or `euler`
 
