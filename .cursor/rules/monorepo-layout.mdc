@@ -36,5 +36,6 @@ Multi-app monorepo: **one Next.js frontend** (SEO + product) talks to **Python i
 
 ## Current state
 
-- **Inference API** lives in **`services/inference-api/`** (run via `make run` from repo root).
-- **`apps/web/`** is reserved for the Next.js app (placeholder README until scaffolded). Do not add a second ad-hoc frontend at the repository root.
+- **Inference API** lives in **`services/inference-api/`** (run via `make run` from repo root). Includes `router.py` (`quality_tier`), rate limits, and API key auth.
+- **`apps/web/`** is a scaffolded Next.js app (generate UI + server Route Handler proxy). Do not add a second ad-hoc frontend at the repository root.
+- **Docs:** root `README.md`, `ARCHITECTURE.md` (current + target diagrams), `apps/web/README.md`.

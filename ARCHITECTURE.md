@@ -2,11 +2,12 @@
 
 ## Overview
 
-This project is a local-first SDXL image generation API built for Apple Silicon. The system is intentionally structured as a small, testable backend with clear boundaries between:
+This project is a **monorepo**: a local-first SDXL image generation API (Apple Silicon / MPS) plus a **Next.js** client. The system is intentionally structured with clear boundaries between:
 
-- request validation
-- HTTP orchestration
+- request validation and routing policy
+- HTTP orchestration (auth, limits, jobs — future)
 - inference execution
+- web UI and server-side proxy
 - observability and failure handling
 
 The repository is code-only. Model weights, generated images, caches, and local virtual environments are intentionally excluded from git history.
@@ -19,11 +20,15 @@ The repository is code-only. Model weights, generated images, caches, and local 
 
 Defines the API contracts:
 
-- `GenerateRequest`
+- `GenerateRequest` (includes optional `quality_tier`)
 - `GenerateResponse`
 - `ErrorResponse`
 
 This layer protects the inference engine from invalid input shapes and keeps response/error formats explicit.
+
+### `services/inference-api/router.py`
+
+Maps `quality_tier` (`fast` | `balanced` | `quality`) to concrete `steps` and `guidance_scale` before inference. Returns `(effective_request, model_id)`; today `model_id` is always `sdxl_base`. Does not load alternate checkpoints yet.
 
 ### `services/inference-api/engine.py`
 
@@ -50,34 +55,33 @@ Owns API orchestration:
 
 This file should remain focused on transport, policy, and observability rather than model logic.
 
-### `services/inference-api/tests/test_integration_api.py`
+### `apps/web/`
 
-Runs ASGI-level integration tests with mocked model execution. These tests validate:
+Next.js product shell: public UI, `POST /api/generate` Route Handler (server-side proxy with `SDXL_API_KEY`), no torch.
 
-- health endpoint behavior
-- success response contract
-- 401 API key authentication behavior
-- 429 backpressure behavior
-- 500 dev/prod error behavior
-- 504 timeout behavior
+### `services/inference-api/tests/`
 
-This suite is the primary regression safety net for backend contract changes.
+- `test_integration_api.py` — ASGI tests with mocked GPU (auth, rate limit, backpressure, 500/504, success contract).
+- `test_router.py` — unit tests for `apply_quality_tier` (no GPU).
 
-## Runtime Flow
+These suites are the primary regression safety net for backend contract changes.
+
+## Runtime Flow (inference API)
 
 ```mermaid
 flowchart TD
-    A["Client"] --> B["FastAPI Middleware"]
+    A["Client or Next proxy"] --> B["FastAPI Middleware"]
     B --> C["Request ID Assigned"]
-    C --> D["Route Handler"]
+    C --> D["Route Handler /generate"]
     D --> E["Pydantic Validation"]
-    E --> F["Backpressure Check"]
-    F -->|Rejected| G["429 capacity_reached"]
-    F -->|Accepted| H["run_in_executor"]
-    H --> I["SDXLEngine.generate"]
-    I --> J["Scheduler Configuration"]
-    J --> K["SDXL Inference on MPS"]
-    K --> L["BytesIO -> Base64"]
+    E --> Auth["API key + rate limit"]
+    Auth --> F["Backpressure Check"]
+    F -->|Rejected| G["429 capacity_reached or rate_limited"]
+    F -->|Accepted| T["apply_quality_tier"]
+    T --> H["run_in_executor"]
+    H --> I["SDXLEngine.generate(effective)"]
+    I --> K["SDXL Inference on MPS"]
+    K --> L["BytesIO -> Base64 + metadata"]
     L --> M["200 Success Response"]
     H -->|Timeout| N["504 generation_timeout"]
     D -->|Unhandled error| O["500 internal_error"]
@@ -88,14 +92,16 @@ flowchart TD
 
 ### Success path
 
-1. Client sends `POST /generate`.
+1. Client (or Next.js proxy) sends `POST /generate`.
 2. Middleware assigns `request_id` and starts timing.
 3. Request body is validated by `GenerateRequest`.
-4. API checks generation capacity via semaphore.
-5. If capacity is available, inference is offloaded to a worker thread.
-6. `engine.generate()` configures scheduler and inference settings.
-7. Output image is encoded in memory and returned as Base64 JSON.
-8. Metrics and request logs are updated.
+4. API key and per-key rate limit are enforced.
+5. API checks generation capacity via semaphore.
+6. `apply_quality_tier()` may override `steps` / `guidance_scale`; `model_id` is set for metadata.
+7. If capacity is available, inference is offloaded to a worker thread with the **effective** request.
+8. `engine.generate()` runs scheduler configuration and MPS inference.
+9. Output image is encoded in memory and returned as Base64 JSON with metadata (`model_id`, `quality_tier`, effective steps/CFG, `seed`).
+10. Metrics and request logs are updated.
 
 ### Backpressure path
 
@@ -366,8 +372,10 @@ sequenceDiagram
 Prefer editing:
 
 - `services/inference-api/schemas.py` for API contract changes
+- `services/inference-api/router.py` for tier → steps/CFG (and future model selection)
 - `services/inference-api/main.py` for routing, policy, and metrics
 - `services/inference-api/engine.py` for inference/runtime behavior
+- `apps/web/src/app/api/generate/route.ts` and UI components for client/proxy changes
 
 ### Before pushing
 

@@ -1,36 +1,66 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Web (`apps/web`)
 
-## Getting Started
+Next.js App Router UI for the SDXL inference API. The browser never holds the GPU API key: generation goes through a **server Route Handler** that proxies to FastAPI.
 
-First, run the development server:
+## Prerequisites
+
+- Inference API running (from repo root: `make run` → `http://127.0.0.1:8001`)
+- Node.js 20+
+
+## Setup
 
 ```bash
+cd apps/web
+cp .env.example .env.local
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Environment (`/.env.local`)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Variable | Purpose |
+|----------|---------|
+| `SDXL_API_URL` | Upstream generate URL (default `http://127.0.0.1:8001/generate`) |
+| `SDXL_API_KEY` | Sent as `X-API-Key` from the server only |
 
-## Learn More
+Do **not** prefix the API key with `NEXT_PUBLIC_`.
 
-To learn more about Next.js, take a look at the following resources:
+## Project structure
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```text
+src/
+├── app/
+│   ├── api/generate/route.ts   # POST proxy to inference API
+│   ├── page.tsx                # Generate UI
+│   └── layout.tsx
+└── components/
+    └── generate-form.tsx       # Client form + result / errors
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Scripts
 
-## Deploy on Vercel
+| Command | Description |
+|---------|-------------|
+| `npm run dev` | Dev server (port 3000) |
+| `npm run build` | Production build |
+| `npm run start` | Serve production build |
+| `npm run lint` | ESLint |
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## API usage from the UI
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+The form `POST`s JSON `{ "prompt": "..." }` to `/api/generate`. To use server-side quality tiers, extend the form body with `quality_tier` (`fast` | `balanced` | `quality`) — the inference API applies profiles from `services/inference-api/router.py`.
+
+Successful responses expose `metadata` (including `model_id`, `steps`, `request_id` via response headers).
+
+## Deploy notes
+
+- Deploy Next (e.g. Vercel) separately from the GPU API.
+- Set `SDXL_API_URL` to a reachable inference host in production.
+- Inference on GPU cloud (e.g. Spheron) is documented in the repo root [ARCHITECTURE.md](../../ARCHITECTURE.md).
+
+## Learn more
+
+- Repo root [README.md](../../README.md)
+- [Next.js documentation](https://nextjs.org/docs)
