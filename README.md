@@ -1,139 +1,157 @@
 # SDXL Image API
 
-Local FastAPI service for SDXL image generation on Apple Silicon using MPS.
+Monorepo for **local SDXL image generation** on Apple Silicon (MPS) and a **Next.js** UI. The FastAPI service owns the HTTP contract; the web app proxies requests so API keys stay on the server.
+
+**Design docs:** [ARCHITECTURE.md](./ARCHITECTURE.md) (system context, roadmap) · [LLD.md](./LLD.md) (modules, sequences, contracts, Mermaid diagrams).
 
 ## Repository layout
 
 | Path | Purpose |
 |------|---------|
-| `services/inference-api/` | FastAPI app: `main.py`, `engine.py`, `schemas.py`, `tests/` |
-| `apps/web/` | Next.js frontend (placeholder — see `apps/web/README.md`) |
-| `packages/` | Optional shared TS/types or constants (see `packages/README.md`) |
+| `services/inference-api/` | FastAPI: `main.py`, `engine.py`, `router.py`, `schemas.py`, `tests/` |
+| `apps/web/` | Next.js App Router UI + `POST /api/generate` proxy |
+| `packages/` | Optional shared TS types / constants (empty until needed) |
 | `.cursor/rules/` | Cursor project rules (monorepo, Python, quality bar) |
-| `models/` | Local SDXL weights (gitignored) at `models/sdxl-base` |
+| `models/` | Local SDXL weights (**gitignored**) at `models/sdxl-base` |
 
-### Source tree (application + docs)
-
-Only **source and docs** — not `.venv`, `models/`, or `__pycache__`:
+### Source tree (tracked in git)
 
 ```text
 image-sd/
-├── .cursor/rules/          # Cursor *.mdc rules
-├── apps/web/README.md      # Next.js placeholder
-├── packages/README.md      # optional shared packages
+├── .cursor/rules/
+├── apps/web/
+│   ├── src/app/              # pages + api/generate route
+│   ├── src/components/       # generate form
+│   └── .env.example
+├── packages/                 # optional shared TS (empty)
 ├── services/inference-api/
 │   ├── client.py
 │   ├── engine.py
 │   ├── main.py
+│   ├── router.py
 │   ├── schemas.py
 │   └── tests/
-│       └── test_integration_api.py
+│       ├── test_integration_api.py
+│       └── test_router.py
 ├── ARCHITECTURE.md
+├── LLD.md
 ├── Makefile
+├── requirements.txt          # Python lockfile (see Install)
 └── README.md
 ```
 
-## Collaboration Notes
+**Not in git:** `.venv/`, `models/`, `generated/`, `apps/web/node_modules/`, `apps/web/.next/`, `.env` / `.env.local`, local `*.jpg` outputs.
 
-This repository is intentionally code-only for collaboration.
+## Quick start (API + web)
 
-- `models/` is not tracked in git
-- `generated/` is not tracked in git
-- teammates should pull the repo first, then download model assets locally
+### 1. Python inference API
 
-### Working Agreement
+From the repository root:
 
-- Backend contract lives in `services/inference-api/main.py`, `schemas.py`, and integration tests
-- Inference implementation lives in `services/inference-api/engine.py`
-- Large model files stay out of git history
-- Product changes should preserve the current error and metrics contracts unless intentionally versioned
-
-### System Flow
-
-```mermaid
-flowchart TD
-    A["Client / Frontend"] --> B["FastAPI Routes"]
-    B --> C["Validation (Pydantic Schemas)"]
-    C --> D["Backpressure Guard"]
-    D --> E["Timeout Guard"]
-    E --> F["SDXLEngine"]
-    F --> G["Local SDXL Model"]
-    F --> I["BytesIO Image Buffer"]
-    I --> J["Base64 API Response"]
-    B --> K["Metrics + Request ID Logging"]
+```bash
+python -m venv .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+uv pip install diffusers uvicorn accelerate   # if not already present in your env
 ```
 
-### Cofounder Setup
+Download weights into `./models/sdxl-base` (see [Download model](#download-model-locally)).
 
-1. Clone the repository.
-2. Create and activate `.venv`.
-3. Install dependencies.
-4. Download the SDXL model locally into `./models/sdxl-base`.
-5. Run `make test-integration`.
-6. Start the API with `make run`.
+```bash
+make test-integration
+make run
+```
+
+API: `http://127.0.0.1:8001` — docs at `/docs`, health at `/health`.
+
+### 2. Next.js web app
+
+In a second terminal:
+
+```bash
+cd apps/web
+cp .env.example .env.local   # adjust SDXL_API_URL / SDXL_API_KEY if needed
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`, enter a prompt, and generate. The UI calls `/api/generate`, which forwards to the inference API with `X-API-Key` on the server.
+
+## System flow (today)
+
+```mermaid
+flowchart LR
+    Browser --> Next["apps/web"]
+    Next --> Proxy["Route Handler /api/generate"]
+    Proxy --> API["FastAPI /generate"]
+    API --> Tier["router.apply_quality_tier"]
+    Tier --> Engine["SDXLEngine"]
+    Engine --> MPS["MPS / models/sdxl-base"]
+    MPS --> API
+    API --> Proxy
+    Proxy --> Browser
+```
 
 ## Requirements
 
-- macOS with Apple Silicon
-- Python virtual environment at `.venv`
+- macOS with Apple Silicon (MVP target)
+- Python 3.12+ in `.venv` at repo root
+- Node.js 20+ for `apps/web`
 - Local model files under `./models/sdxl-base`
 
-## Activate Environment
+## Install dependencies (Python)
+
+With `uv` and an activated `.venv`:
 
 ```bash
-cd /Users/kiran-giga-se/Desktop/kk/img/image-sd
-source .venv/bin/activate
+uv pip install -r requirements.txt
 ```
 
-## Install Dependencies
+The root `requirements.txt` is a broad environment lockfile. Inference needs **diffusers** and **uvicorn**; install them if imports fail:
 
-If using `uv`, install project dependencies into the active virtual environment first:
+```bash
+uv pip install diffusers uvicorn accelerate
+```
+
+Minimal inference-only set (fresh venv):
 
 ```bash
 uv pip install fastapi uvicorn torch diffusers transformers accelerate pydantic pillow huggingface_hub httpx requests
 ```
 
-## Download Model Locally
+## Download model locally
 
-This repository does not track model weights in git. Each collaborator must download the SDXL model locally into `./models/sdxl-base`.
-
-Run:
+Weights are **not** in git. Each machine needs **SDXL base 1.0** at `./models/sdxl-base`:
 
 ```bash
 python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='stabilityai/stable-diffusion-xl-base-1.0', local_dir='./models/sdxl-base', allow_patterns=['model_index.json','scheduler/*','tokenizer/*','tokenizer_2/*','text_encoder/config.json','text_encoder/model.fp16.safetensors','text_encoder_2/config.json','text_encoder_2/model.fp16.safetensors','vae/config.json','vae/diffusion_pytorch_model.fp16.safetensors','unet/config.json','unet/diffusion_pytorch_model.fp16.safetensors'])"
 ```
 
-## Start the Server
+**Note:** Defaults and `quality_tier` profiles are tuned for **base SDXL** (more steps, higher CFG). `/health` may still report `"optimization": "lightning"` — that field is legacy; actual weights are base 1.0.
 
-From the repository root:
+Override model path: `SDXL_MODEL_PATH=/path/to/weights make run`.
+
+## Start the inference server
 
 ```bash
 make run
 ```
 
-Or manually (from `services/inference-api/`):
+Or manually:
 
 ```bash
 cd services/inference-api && source ../../.venv/bin/activate && uvicorn main:app --host 127.0.0.1 --port 8001 --reload
 ```
 
-The API will be available at:
+Default port **8001** (`PORT=8000 make run` to override).
 
-```text
-http://127.0.0.1:8001
-```
-
-(`make run` uses port **8001** by default; use another port if it is already in use, e.g. `PORT=8000 make run`.)
-
-## Health Check
-
-Use this to confirm the engine is loaded:
+## Health check
 
 ```bash
 curl http://127.0.0.1:8001/health
 ```
 
-Expected response:
+Example:
 
 ```json
 {"status":"healthy","engine":"mps","backend":"diffusers","optimization":"lightning"}
@@ -141,167 +159,125 @@ Expected response:
 
 ## Metrics
 
-Use this to inspect basic runtime counters and generation latency:
-
 ```bash
 curl http://127.0.0.1:8001/metrics -H "X-API-Key: dev-local-key"
 ```
 
-## Backpressure Behavior
-
-When `MAX_INFLIGHT_GENERATIONS` is reached, new `/generate` requests should return `429` instead of queueing forever.
-
-Run two generation requests in parallel:
-
-```bash
-curl -s -X POST "http://127.0.0.1:8001/generate" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-local-key" \
-  -d '{"prompt":"request one"}' >/tmp/r1.json &
-curl -s -X POST "http://127.0.0.1:8001/generate" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-local-key" \
-  -d '{"prompt":"request two"}' >/tmp/r2.json &
-wait
-cat /tmp/r1.json
-cat /tmp/r2.json
-```
-
-Then verify rejection counters:
-
-```bash
-curl -s http://127.0.0.1:8001/metrics -H "X-API-Key: dev-local-key"
-```
-
-Look for:
-
-- `generate_rejected_total` increasing when capacity is exceeded
-- `generate_inflight` returning to `0` after requests complete
-
-## Generate an Image
-
-The `/generate` endpoint returns a JSON response with a Base64-encoded image.
-
-```bash
-curl -X POST "http://127.0.0.1:8001/generate" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-local-key" \
-  -d '{
-    "prompt":"a cinematic portrait of a tiger in rain, ultra detailed",
-    "width":1024,
-    "height":1024,
-    "steps":4,
-    "guidance_scale":1.0,
-    "scheduler":"dpm++2m_karras",
-    "seed":1234
-  }'
-```
-
-Each response also includes an `X-Request-ID` header for tracing.
-
 ## API key authentication
 
 - `/generate` and `/metrics` require header `X-API-Key`.
-- Default key for local development is `dev-local-key`.
-- Override with env var `SDXL_API_KEY` before `make run`.
+- Default dev key: `dev-local-key` (override with `SDXL_API_KEY` before `make run`).
+- Next.js reads the same values from `apps/web/.env.local` (`SDXL_API_KEY`, `SDXL_API_URL`) — never expose the key to the browser.
 
-## Request Fields
+## Generate an image
 
-- `prompt`: text prompt for the image
-- `negative_prompt`: optional negative prompt
-- `seed`: optional manual seed
-- `width`: image width, `512` to `1536`, multiple of `8`
-- `height`: image height, `512` to `1536`, multiple of `8`
-- `steps`: default `4`, allowed `1` to `8`
-- `guidance_scale`: default `1.0`, allowed `0.0` to `2.0`
-- `clip_skip`: default `2`
-- `scheduler`: `dpm++2m_karras` or `euler`
+### With `quality_tier` (recommended for base SDXL)
 
-## Save the Returned Image
+The server sets `steps` and `guidance_scale` from `services/inference-api/router.py`:
 
-Because the API returns Base64, use the helper client or decode the response yourself.
+| Tier | Steps | Guidance |
+|------|-------|----------|
+| `fast` | 12 | 5.0 |
+| `balanced` | 25 | 6.0 |
+| `quality` | 35 | 7.0 |
 
-Run the sample client:
+```bash
+curl -sS -X POST "http://127.0.0.1:8001/generate" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-local-key" \
+  -d '{
+    "prompt": "a cinematic portrait of a tiger in rain, ultra detailed",
+    "quality_tier": "balanced",
+    "width": 1024,
+    "height": 1024,
+    "seed": 1234
+  }'
+```
+
+### Explicit steps (no tier override)
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8001/generate" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-local-key" \
+  -d '{
+    "prompt": "a red apple on a wooden table",
+    "steps": 25,
+    "guidance_scale": 6.0,
+    "scheduler": "dpm++2m_karras"
+  }'
+```
+
+Success responses include `image_base64` and `metadata` (`steps`, `guidance_scale`, `model_id`, `quality_tier`, `seed`, …). Responses include header `X-Request-ID`.
+
+`GENERATION_TIMEOUT_SECONDS` defaults to **90** in `main.py`; quality tiers can take most of that on a Mac — watch logs for `generation_timeout` (504).
+
+## Request fields
+
+| Field | Description |
+|-------|-------------|
+| `prompt` | Required text prompt |
+| `negative_prompt` | Optional; default anti-artifact string |
+| `seed` | Optional; random if omitted |
+| `width` / `height` | 512–1536, multiple of 8; default 1024 |
+| `steps` | 1–40; default 4 (use tier or raise for base SDXL) |
+| `guidance_scale` | 0.0–12.0; default 1.0 |
+| `quality_tier` | Optional: `fast`, `balanced`, `quality` — overrides steps/CFG |
+| `clip_skip` | 1–4; default 2 |
+| `scheduler` | `dpm++2m_karras` or `euler` |
+
+Unknown fields (e.g. `lora_path`) return **422**.
+
+## Backpressure and rate limits
+
+- **Capacity:** `MAX_INFLIGHT_GENERATIONS=1` → second concurrent `/generate` gets **429** `capacity_reached` with `Retry-After: 5`.
+- **Rate limit:** per API key, sliding window → **429** `rate_limited`.
+
+## Save the returned image
 
 ```bash
 cd services/inference-api && source ../../.venv/bin/activate && python client.py
 ```
 
-Or decode manually in Python:
+Or decode JSON with Python/`base64` (outputs are gitignored if written beside the service).
+
+## Integration tests
 
 ```bash
-python - <<'PY'
-import requests
-import base64
-
-response = requests.post(
-    "http://127.0.0.1:8001/generate",
-    headers={"X-API-Key": "dev-local-key"},
-    json={"prompt": "a cinematic portrait of a tiger in rain"}
-)
-response.raise_for_status()
-data = response.json()
-
-with open("output.jpg", "wb") as f:
-    f.write(base64.b64decode(data["image_base64"]))
-
-print("Saved output.jpg")
-PY
-```
-
-## API Docs
-
-Interactive Swagger UI:
-
-```text
-http://127.0.0.1:8001/docs
-```
-
-## Integration Tests
-
-Run the full integration suite:
-
-```bash
-cd /path/to/image-sd
 make test-integration
 ```
 
-Or:
+Runs `test_integration_api.py` and `test_router.py` with **mocked** GPU work.
+
+## Web app (`apps/web`)
+
+From repo root, in a second terminal:
 
 ```bash
-cd services/inference-api && source ../../.venv/bin/activate && python -m unittest discover -s tests -p 'test_*.py' -v
+cd apps/web
+cp .env.example .env.local
+npm install
+npm run dev
 ```
 
-The tests use ASGI integration calls with mocked model loading/generation so they validate API behavior without GPU-heavy startup.
+- UI: `http://localhost:3000`
+- Server route `src/app/api/generate/route.ts` proxies to `SDXL_API_URL` with `X-API-Key` from env
+- Client: `src/components/generate-form.tsx` — extend the POST body with `quality_tier` when you want tiered generation
 
-## Model Notes
+## Collaboration notes
 
-- The service loads weights from **`<repository root>/models/sdxl-base`** by default. Override with env **`SDXL_MODEL_PATH`** if you store models elsewhere.
-- Loading is offline-only; it does not download model files at runtime
-- The code uses fp16 safetensors on MPS
+- Contract source of truth: `schemas.py` + integration tests.
+- Inference only in `engine.py` (and future engine modules).
+- Contract changes → update tests, this README, and `ARCHITECTURE.md` when behavior meaning changes.
 
-## Common Issues
+## Common issues
 
-If startup fails because model files are missing, verify these exist:
+**Missing model files** — ensure `models/sdxl-base/model_index.json` and fp16 safetensors exist (see download command).
 
-```text
-./models/sdxl-base/model_index.json
-./models/sdxl-base/unet/diffusion_pytorch_model.fp16.safetensors
-./models/sdxl-base/vae/diffusion_pytorch_model.fp16.safetensors
-./models/sdxl-base/text_encoder/model.fp16.safetensors
-./models/sdxl-base/text_encoder_2/model.fp16.safetensors
-```
+**504 timeout** — lower tier, reduce steps, or raise `GENERATION_TIMEOUT_SECONDS` for local dev.
 
-If `GET /` returns `404 Not Found`, that is expected. Use `/health`, `/docs`, or `POST /generate`.
+**Blurry images with default `steps: 4`** — you are on **base** weights; use `quality_tier: "balanced"` or higher steps/CFG.
 
-If you get:
+**Next cannot reach API** — inference must be on `127.0.0.1:8001`; check `apps/web/.env.local`.
 
-```text
-Error no file named model_index.json found in directory ./models/sdxl-base
-```
-
-then the local model has not been downloaded yet. Run the model download command from the `Download Model Locally` section.
-
-If you send undeclared fields such as `lora_path`, the API returns `422 Unprocessable Entity`. Deferred features are intentionally blocked in the current build so the active product surface stays stable and readable for collaborators.
-
-If third-party logs appear during failures, they should now render with `request_id=-` instead of breaking the logging formatter.
+**`GET /` returns 404** — use `/health`, `/docs`, or `POST /generate`.

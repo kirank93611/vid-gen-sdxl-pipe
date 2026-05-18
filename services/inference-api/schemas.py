@@ -1,13 +1,13 @@
 from pydantic import BaseModel, ConfigDict, Field
-from typing import Annotated
+from typing import Annotated, Literal
 
 # PEP 604: Using | instead of Optional/Union
 # PEP 585: Using built-in collections (dict)
 
 class GenerateRequest(BaseModel):
     """
-    Validation schema for SDXL-Lightning generation.
-    Optimized for Apple Silicon memory constraints.
+    Validation schema for SDXL base generation.
+    Optimized for Apple Silicon memory constraints(Uses MPS).
 
     This class is the API contract for POST /generate input.
     FastAPI + Pydantic validate this before inference runs.
@@ -30,13 +30,19 @@ class GenerateRequest(BaseModel):
     width: Annotated[int, Field(default=1024, ge=512, le=1536, multiple_of=8)]
     height: Annotated[int, Field(default=1024, ge=512, le=1536, multiple_of=8)]
 
-    # SDXL-Lightning specific defaults (4 steps, 1.0 guidance)
-    steps: Annotated[int, Field(default=4, ge=1, le=8)]
-    guidance_scale: Annotated[float, Field(default=1.0, ge=0.0, le=2.0)]
+    # SDXL base specific defaults (4 steps, 1.0 guidance)
+    steps: Annotated[int, Field(default=4, ge=1, le=40)]
+    guidance_scale: Annotated[float, Field(default=1.0, ge=0.0, le=12.0)]
     
     # Runtime tuning knobs for text encoder and denoiser behavior.
     clip_skip: Annotated[int, Field(default=2, ge=1, le=4)]
     scheduler: str = Field(default="dpm++2m_karras")
+
+    # tier field
+    quality_tier: Literal["fast", "balanced", "quality"] | None = Field(
+        default=None,
+        description="When set, server maps this to steps and guidance_scale (see router.py).",
+    )
 
 class GenerateResponse(BaseModel):
     """

@@ -11,8 +11,8 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from schemas import GenerateRequest, GenerateResponse, ErrorResponse
-from engine import SDXLEngine
-
+from registry import EngineRegistry
+from router import apply_quality_tier
 
 # Repo root: .../image-sd (models live at <repo>/models/sdxl-base)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -29,7 +29,10 @@ app = FastAPI(
 
 # Shared global engine instance
 # Initialized at startup for Apple Silicon memory stability
-engine = SDXLEngine(model_path=os.environ.get("SDXL_MODEL_PATH", str(_DEFAULT_MODEL)))
+# Lazy engine cache; first /generate loads weights (see registry.get_engine).
+registry = EngineRegistry(
+    default_model_path = os.environ.get("SDXL_MODEL_PATH",str(_DEFAULT_MODEL))
+    )
 logger = logging.getLogger("sdxl_api")
 
 
@@ -64,7 +67,7 @@ EXPECTED_API_KEY = os.getenv("SDXL_API_KEY", "dev-local-key")
 _metrics_lock = threading.Lock()
 
 MAX_INFLIGHT_GENERATIONS = 1
-GENERATION_TIMEOUT_SECONDS = 45
+GENERATION_TIMEOUT_SECONDS = 90
 _generate_semaphore = threading.Semaphore(MAX_INFLIGHT_GENERATIONS)
 
 _metrics: dict[str, int | float] = {
@@ -175,6 +178,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     500: {"model": ErrorResponse},
     504: {"model": ErrorResponse},
 })
+
 async def generate(payload: GenerateRequest, http_request: Request) -> GenerateResponse | JSONResponse:
     """
     Primary inference endpoint.
@@ -249,12 +253,29 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
         _metrics["generate_accepted_total"] += 1
         _metrics["generate_inflight"] += 1
 
-    
+    effective, model_id = apply_quality_tier(payload)
+
+    #Resolve runtime engine for routed model_id (loads on first use per id).
+    try:
+        engine = registry.get_engine(model_id)
+    except ValueError as exc:
+        _log_error("POST /generate rejected reason=unsupported_model_id", request_id)
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "error",
+                "error_code": "unsupported_model_id",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+
     # Offload the blocking CPU/GPU bound task
     start = time.perf_counter()
     try:
         image_bytes, used_seed = await asyncio.wait_for(
-            loop.run_in_executor(None, engine.generate, payload),
+            loop.run_in_executor(None, engine.generate, effective),
             timeout=GENERATION_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
@@ -287,6 +308,9 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
     with _metrics_lock:
         _metrics["generate_success_total"] += 1
 
+
+    
+
     # Encode raw bytes to Base64 (Stateless Delivery)
     image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -294,14 +318,16 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
         status="success",
         image_base64=image_base64,
         metadata={
-            "prompt": payload.prompt,
-            "width": payload.width,
-            "height": payload.height,
-            "steps": payload.steps,
-            "guidance_scale": payload.guidance_scale,
-            "clip_skip": payload.clip_skip,
-            "scheduler": payload.scheduler,
+            "prompt": effective.prompt,
+            "width": effective.width,
+            "height": effective.height,
+            "steps": effective.steps,
+            "guidance_scale": effective.guidance_scale,
+            "clip_skip": effective.clip_skip,
+            "scheduler": effective.scheduler,
             "seed": used_seed,
+            "model_id": model_id,
+            "quality_tier": payload.quality_tier,
         }
     )
 
