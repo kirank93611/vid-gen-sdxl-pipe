@@ -2,7 +2,7 @@
 
 Monorepo for **local SDXL image generation** on Apple Silicon (MPS) and a **Next.js** UI. The FastAPI service owns the HTTP contract; the web app proxies requests so API keys stay on the server.
 
-**Deeper design (current + target pipelines, Spheron):** see [ARCHITECTURE.md](./ARCHITECTURE.md).
+**Design docs:** [ARCHITECTURE.md](./ARCHITECTURE.md) (system context, roadmap) · [LLD.md](./LLD.md) (modules, sequences, contracts, Mermaid diagrams).
 
 ## Repository layout
 
@@ -34,6 +34,7 @@ image-sd/
 │       ├── test_integration_api.py
 │       └── test_router.py
 ├── ARCHITECTURE.md
+├── LLD.md
 ├── Makefile
 ├── requirements.txt          # Python lockfile (see Install)
 └── README.md

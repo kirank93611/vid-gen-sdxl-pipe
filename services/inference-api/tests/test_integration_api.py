@@ -50,7 +50,13 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
             for key in main._metrics:
                 main._metrics[key] = 0.0 if isinstance(main._metrics[key], float) else 0
         main._generate_semaphore = threading.Semaphore(main.MAX_INFLIGHT_GENERATIONS)
-        main.engine.generate = _fake_generate_ok.__get__(main.engine, type(main.engine))
+        
+        class _FakeEngine:
+            def generate(self, req: Any) -> tuple[bytes, int]:
+                return _fake_generate_ok(self, req)
+
+        main.registry.get_engine = lambda _model_id: _FakeEngine()
+        
         main.EXPECTED_API_KEY = self.API_HEADERS["X-API-Key"]
 
     async def asyncTearDown(self) -> None:
@@ -83,8 +89,11 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         def _slow_generate(self: Any, req: Any) -> tuple[bytes, int]:
             time.sleep(0.25)
             return b"slow-bytes", 777
+        class _Engine:
+            def generate(self, req: Any) -> tuple[bytes, int]:
+                return _slow_generate(self, req)
 
-        main.engine.generate = _slow_generate.__get__(main.engine, type(main.engine))
+        main.registry.get_engine = lambda _model_id: _Engine()
         req1 = self.client.post("/generate", json={"prompt": "one"}, headers=self.API_HEADERS)
         req2 = self.client.post("/generate", json={"prompt": "two"}, headers=self.API_HEADERS)
         r1, r2 = await asyncio.gather(req1, req2)
@@ -107,7 +116,11 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         def _raise_generate(self: Any, req: Any) -> tuple[bytes, int]:
             raise RuntimeError("boom")
 
-        main.engine.generate = _raise_generate.__get__(main.engine, type(main.engine))
+        class _Engine:
+            def generate(self, req: Any) -> tuple[bytes, int]:
+                return _raise_generate(self, req)  # or call _raise_generate / _very_slow_generate inside
+
+        main.registry.get_engine = lambda _model_id: _Engine()
         resp = await self.client.post("/generate", json={"prompt": "fail"}, headers=self.API_HEADERS)
 
         self.assertEqual(resp.status_code, 500)
@@ -122,7 +135,11 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         
         old_env = main.APP_ENV
         main.APP_ENV = "dev"
-        main.engine.generate = _raise_generate.__get__(main.engine, type(main.engine))
+        class _Engine:
+            def generate(self, req: Any) -> tuple[bytes, int]:
+                return _raise_generate(self, req)  # or call _raise_generate / _very_slow_generate inside
+
+        main.registry.get_engine = lambda _model_id: _Engine()
         try:
             resp = await self.client.post("/generate", json={"prompt": "fail"}, headers=self.API_HEADERS)
         finally:
@@ -142,7 +159,11 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         
         old_env = main.APP_ENV
         main.APP_ENV = "prod"
-        main.engine.generate = _raise_generate.__get__(main.engine, type(main.engine))
+        class _Engine:
+            def generate(self, req: Any) -> tuple[bytes, int]:
+                return _raise_generate(self, req)  # or call _raise_generate / _very_slow_generate inside
+
+        main.registry.get_engine = lambda _model_id: _Engine()
         try:
             resp = await self.client.post("/generate", json={"prompt":"fail"}, headers=self.API_HEADERS)
         finally:
@@ -162,7 +183,11 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
 
         old_timeout = main.GENERATION_TIMEOUT_SECONDS
         main.GENERATION_TIMEOUT_SECONDS = 0.1
-        main.engine.generate = _very_slow_generate.__get__(main.engine, type(main.engine))
+        class _Engine:
+            def generate(self, req: Any) -> tuple[bytes, int]:
+                return _very_slow_generate(self, req)  # or call _raise_generate / _very_slow_generate inside
+
+        main.registry.get_engine = lambda _model_id: _Engine()
         try:
             resp = await self.client.post("/generate", json={"prompt": "timeout"}, headers=self.API_HEADERS)
         finally:

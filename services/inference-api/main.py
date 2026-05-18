@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from schemas import GenerateRequest, GenerateResponse, ErrorResponse
-from engine import SDXLEngine
+from registry import EngineRegistry
 from router import apply_quality_tier
 
 # Repo root: .../image-sd (models live at <repo>/models/sdxl-base)
@@ -29,7 +29,10 @@ app = FastAPI(
 
 # Shared global engine instance
 # Initialized at startup for Apple Silicon memory stability
-engine = SDXLEngine(model_path=os.environ.get("SDXL_MODEL_PATH", str(_DEFAULT_MODEL)))
+# Lazy engine cache; first /generate loads weights (see registry.get_engine).
+registry = EngineRegistry(
+    default_model_path = os.environ.get("SDXL_MODEL_PATH",str(_DEFAULT_MODEL))
+    )
 logger = logging.getLogger("sdxl_api")
 
 
@@ -175,6 +178,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     500: {"model": ErrorResponse},
     504: {"model": ErrorResponse},
 })
+
 async def generate(payload: GenerateRequest, http_request: Request) -> GenerateResponse | JSONResponse:
     """
     Primary inference endpoint.
@@ -250,6 +254,22 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
         _metrics["generate_inflight"] += 1
 
     effective, model_id = apply_quality_tier(payload)
+
+    #Resolve runtime engine for routed model_id (loads on first use per id).
+    try:
+        engine = registry.get_engine(model_id)
+    except ValueError as exc:
+        _log_error("POST /generate rejected reason=unsupported_model_id", request_id)
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "error",
+                "error_code": "unsupported_model_id",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
 
     # Offload the blocking CPU/GPU bound task
     start = time.perf_counter()

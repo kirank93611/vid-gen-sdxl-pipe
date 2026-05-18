@@ -14,6 +14,8 @@ The repository is code-only. Model weights, generated images, caches, and local 
 
 **Companion conventions:** Repo-wide rules for monorepo layout (Next.js + FastAPI), SEO/product boundaries, contract testing, and merge checklists live in `.cursor/rules/` — start with `quality-and-contracts.mdc` and `monorepo-layout.mdc`. This document focuses on the **inference service** runtime; those rules cover full-stack and process expectations.
 
+**Low-level detail (classes, HTTP tables, sequences):** [LLD.md](./LLD.md).
+
 ## Current System Shape
 
 ### `services/inference-api/schemas.py`
