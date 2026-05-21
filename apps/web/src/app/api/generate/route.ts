@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 const inferenceUrl =
   process.env.SDXL_API_URL ?? "http://127.0.0.1:8001/generate";
 const apiKey = process.env.SDXL_API_KEY ?? "dev-local-key";
+const fetchTimeoutMs = Number(process.env.SDXL_FETCH_TIMEOUT_MS ?? "600000");
 
 export async function POST(request: Request) {
   let body: unknown;
@@ -28,6 +29,7 @@ export async function POST(request: Request) {
         "X-API-Key": apiKey,
       },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(fetchTimeoutMs),
     });
 
     const text = await upstream.text();

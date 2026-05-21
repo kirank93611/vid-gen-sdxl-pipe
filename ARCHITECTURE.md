@@ -59,7 +59,14 @@ This file should remain focused on transport, policy, and observability rather t
 
 ### `apps/web/`
 
-Next.js product shell: public UI, `POST /api/generate` Route Handler (server-side proxy with `SDXL_API_KEY`), no torch.
+Next.js **Visual Studio** shell (shadcn/ui, Higgsfield-style bottom dock): `/` editor, `/explore` home. Server proxies:
+
+- `POST /api/generate` → inference `/generate`
+- `POST /api/jobs`, `GET /api/jobs/[jobId]` → inference `/jobs`
+
+Secrets stay in `.env.local` (`SDXL_API_KEY`, `SDXL_API_URL`, `SDXL_JOBS_URL`). No torch in the browser.
+
+**Deploy:** `scripts/spheron_deploy_web.sh` on GPU VM; `make spheron-deploy` from Mac. See [README.md](./README.md).
 
 ### `services/inference-api/tests/`
 
@@ -114,10 +121,11 @@ flowchart TD
 
 ### Timeout path
 
-1. Inference starts in a background thread.
+1. Inference runs on a **single-worker** GPU executor (one diffusion at a time).
 2. API waits with `asyncio.wait_for(...)`.
-3. If timeout threshold is exceeded, API returns `504` with `error_code="generation_timeout"`.
-4. Inflight counters and semaphore are still released from `finally`.
+3. On timeout, a cooperative **cancel flag** is set; `SDXLEngine` stops between diffusion steps via `callback_on_step_end`.
+4. The API **awaits executor shutdown** (up to `GENERATION_CANCEL_GRACE_SECONDS`) before releasing the capacity semaphore, so the next request does not overlap on MPS.
+5. Client receives `504` with `error_code="generation_timeout"`.
 
 ### Internal error path
 
@@ -212,14 +220,18 @@ Completed since initial milestone list:
 - lazy-loaded `EngineRegistry` (`registry.py`)
 - integration test for `quality_tier` metadata
 - **Correction loop MVP** — `POST /jobs`, `GET /jobs/{job_id}` (see below)
+- **SDXL inpaint** — `POST /inpaint`, job-step inpaint via `goal.use_inpaint_correction` + optional `mask_base64` / auto center mask (`image_utils.py`)
+- **`DEVICE` env** — `cuda` / `mps` / `cpu` (`device.py`); `/health` reports runtime device
+- **Spheron runbooks** — `scripts/spheron_*.sh`, `make spheron-deploy`, `make deploy-api` / `make deploy-web` on VM
+- **Studio UI refresh** — bottom dock, product job tab, lime theme (`apps/web/src/components/studio/`)
 
 Next planned milestones:
 
-1. **Benchmark evidence** — run `make benchmark-product` on real fixtures; record whether job loop beats baseline CLIP
-2. inpaint engine + mask step for `product_similarity_low` (not only tier bump)
-3. VLM rubric evaluator (composition, artifacts, phone visible, etc.)
-3. thin planner LLM over fixed tools (goal → capability graph, not CFG knobs)
-4. production deploy on GPU cloud (e.g. Spheron) with CUDA backend abstraction
+1. **Benchmark evidence** — `make benchmark-product` / `make spheron-benchmark` on fixtures; record job loop vs baseline CLIP
+2. **Reference-conditioned generation** — IP-Adapter / composite (reference today is CLIP-only, not pixel lock)
+3. VLM rubric evaluator (composition, artifacts, readable text, etc.)
+4. Thin planner LLM over fixed tools (goal → capability graph, not CFG knobs)
+5. Persisted job store + artifact URLs (in-memory jobs lost on restart)
 
 ## Design layers (intent vs execution)
 
@@ -228,7 +240,7 @@ External reviews (May 2026) and product direction align on **four layers**. The 
 | Layer | Module(s) | Thinks in |
 |-------|-----------|-----------|
 | **Goal** | `schemas.VisualGoal`, job brief | `realism`, `preserve_product`, `task` |
-| **Capability** | `capabilities.py` | `text_to_image`, `inpainting` (future) |
+| **Capability** | `capabilities.py` | `text_to_image`, `quality_tier_routing`, `inpainting` |
 | **Policy** | `router.py`, `correction.py`, `quality_tier` | tier bumps, workflow retries |
 | **Adapter** | `sdxl_adapter.py`, `engine.py`, `registry.py` | steps, CFG, scheduler for `sdxl_base` |
 
@@ -254,9 +266,13 @@ sequenceDiagram
     J->>E: evaluate_output(goal, effective)
     E-->>J: passed / issues[]
     alt not passed
-        J->>P: apply_corrections (e.g. bump tier)
-        P-->>J: patched GenerateRequest
-        J->>A: generate (attempt 2..N)
+        J->>P: resolve_correction (tier bump or inpaint)
+        alt tier bump
+            P-->>J: patched GenerateRequest
+            J->>A: generate (attempt 2..N)
+        else inpaint (center mask or mask_base64)
+            J->>A: inpaint on last image
+        end
     end
     J-->>J: status converged | failed | error
     C->>API: GET /jobs/{job_id}
@@ -271,9 +287,11 @@ sequenceDiagram
 
 **Evaluator v0** — rule-based tier/steps vs `VisualGoal` (policy escalation).
 
-**Evaluator v1 (product vertical)** — when `reference_image_base64` is set and `preserve_product` or `product_similarity_min` is set, runs **CLIP image–image similarity** (`clip_evaluator.py`, default threshold `0.85`). Still not full VLM rubric; inpaint/mask corrections are next.
+**Evaluator v1 (product vertical)** — when `reference_image_base64` is set and `preserve_product` or `product_similarity_min` is set, runs **CLIP image–image similarity** (`clip_evaluator.py`, default threshold `0.85`). CLIP measures coarse similarity, not SKU geometry lock.
 
-**MVP corrector** bumps `quality_tier` on `product_similarity_low` and related issues (`fast` → `balanced` → `quality`). Future: localized inpaint, not only tier escalation.
+**Corrector (`resolve_correction`)** — tier bump on policy issues; on `product_similarity_low` with `goal.use_inpaint_correction` (and optional `mask_base64`), may schedule an **inpaint** step after attempt ≥ 2 using `StableDiffusionXLInpaintPipeline` (lazy-loaded). **Does not paste the reference JPEG into the scene.**
+
+**Product expectation:** reference improves measurable CLIP and localized refinement; **faithful product composite** needs reference-conditioned generation (planned).
 
 Stable error codes: `convergence_failed`, `job_not_found` (additive; do not rename without changelog).
 
@@ -413,16 +431,16 @@ sequenceDiagram
 
 | Area | What we have now | Debt if we rush multi-model / agents | Mitigation (do early) |
 |------|------------------|--------------------------------------|------------------------|
-| **Device** | Hard-coded `mps` in `engine.py` | Spheron uses **CUDA**; code paths diverge | `DEVICE` env (`mps` / `cuda` / `cpu`); single factory |
+| **Device** | `DEVICE` env via `device.py` (done) | Multi-GPU routing not supported | Document per-host defaults in README |
 | **Model loading** | `EngineRegistry` lazy per `model_id` | OOM if multiple pipelines; no unload yet | `unload()`; max one resident on Mac |
 | **Routing** | `quality_tier` → steps/CFG only; always `sdxl_base` weights | “fast tier” without Lightning weights is misleading | Separate `model_id` from tier; honest 503 if weights missing |
-| **API shape** | Sync `/generate` + in-process **jobs** (no external queue) | Jobs lost on restart; no ref images yet | Persist job store; artifact URLs; reference uploads |
-| **Correction** | Rules + CLIP vs ref on jobs | Tier bump alone won’t fix all CLIP failures; zombie GPU after timeout | Inpaint patch; hold semaphore until executor completes |
+| **API shape** | Sync `/generate` + in-process **jobs** (no external queue) | Jobs lost on restart | Persist job store; artifact URLs |
+| **Correction** | Rules + CLIP + tier/inpaint on jobs | Inpaint does not composite reference SKU | IP-Adapter / mask composite; tune timeouts per host |
 | **Orchestration** | None (client → API) | Agent logic inside `main.py` | New module `orchestrator/` or external service; **tools** call inference API |
 | **Artifacts** | Base64 in JSON | Huge payloads; bad for multi-step | Job result: file URL / object storage key on cloud |
 | **Metrics** | Global counters | Cannot compare models/tiers | Label metrics by `model_id`, `quality_tier`, job status |
 | **Health** | `optimization: lightning` vs **base** weights on disk | Ops confusion | Health reports `model_id`, `device`, `loaded_models` |
-| **Deploy** | `make run` on laptop | No image, no GPU provider config | Dockerfile + `DEVICE=cuda` + model volume; Spheron deploy API for VM |
+| **Deploy** | README + `spheron_*` scripts (SSH/rsync) | No Dockerfile / IaC yet | Container image; health checks in orchestrator |
 | **Tests** | Mocked engine | Registry/lazy load untested | Unit tests for router + registry; job state machine tests |
 
 ## MacBook M3 Pro (MVP) vs Spheron (production)
@@ -453,7 +471,7 @@ Prefer editing:
 - `services/inference-api/jobs.py` for async correction jobs
 - `services/inference-api/main.py` for routing, policy, and metrics
 - `services/inference-api/engine.py` for inference/runtime behavior (SDXL adapter backend)
-- `apps/web/src/app/api/generate/route.ts` and UI components for client/proxy changes
+- `apps/web/src/app/api/*` and `apps/web/src/components/studio/*` for UI/proxy changes
 
 ### Before pushing
 

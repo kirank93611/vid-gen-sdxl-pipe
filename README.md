@@ -1,366 +1,264 @@
-# SDXL Image API
+# Visual Studio — SDXL product composite
 
-Monorepo for **local SDXL image generation** on Apple Silicon (MPS) and a **Next.js** UI. The FastAPI service owns the HTTP contract; the web app proxies requests so API keys stay on the server.
+Monorepo: **FastAPI inference** (`services/inference-api`) + **Next.js studio** (`apps/web`).
 
-**Design docs:** [ARCHITECTURE.md](./ARCHITECTURE.md) (system context, roadmap) · [LLD.md](./LLD.md) (modules, sequences, contracts, Mermaid diagrams).
+| Doc | Use when |
+|-----|----------|
+| **This README** | Install, run locally, deploy to GPU VM, test |
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | System design, jobs loop, limitations |
+| [LLD.md](./LLD.md) | Modules and API detail |
 
-## Repository layout
+---
+
+## What you need on disk (not in git)
 
 | Path | Purpose |
 |------|---------|
-| `services/inference-api/` | FastAPI: `main.py`, `engine.py`, `router.py`, `schemas.py`, `tests/` |
-| `apps/web/` | Next.js App Router UI + `POST /api/generate` proxy |
-| `packages/` | Optional shared TS types / constants (empty until needed) |
-| `.cursor/rules/` | Cursor project rules (monorepo, Python, quality bar) |
-| `models/` | Local SDXL weights (**gitignored**) at `models/sdxl-base` |
+| `.venv/` | Python env (repo root) |
+| `models/sdxl-base/` | SDXL 1.0 weights (~6.5 GB) |
+| `apps/web/node_modules/` | After `npm install` |
+| `apps/web/.env.local` | Copy from `.env.example` |
 
-### Source tree (tracked in git)
+**Never commit:** `.venv`, `models/`, `node_modules/`, `.next/`, `generated/`, `benchmarks/.../results/`, `.env.local`.
+
+Clean artifacts: `make clean`
+
+---
+
+## Repository layout
 
 ```text
 image-sd/
-├── benchmarks/product_similarity/   # CLIP benchmark manifest + fixtures
-├── scripts/run_product_benchmark.py
-├── .cursor/rules/
-├── apps/web/
-│   ├── src/app/              # pages + api/generate route
-│   ├── src/components/       # generate form
-│   └── .env.example
-├── packages/                 # optional shared TS (empty)
-├── services/inference-api/
-│   ├── client.py
-│   ├── engine.py
-│   ├── main.py
-│   ├── router.py
-│   ├── registry.py
-│   ├── sdxl_adapter.py
-│   ├── evaluator.py
-│   ├── clip_evaluator.py
-│   ├── correction.py
-│   ├── jobs.py
-│   ├── schemas.py
-│   └── tests/
-│       ├── test_integration_api.py
-│       ├── test_router.py
-│       ├── test_evaluator.py
-│       ├── test_correction.py
-│       └── test_clip_evaluator.py
-├── ARCHITECTURE.md
-├── LLD.md
+├── apps/web/                 # Next.js studio (shadcn + bottom dock UI)
+├── services/inference-api/   # FastAPI: /generate, /jobs, /inpaint
+├── scripts/                  # Deploy + benchmark helpers
+├── benchmarks/product_similarity/
 ├── Makefile
-├── requirements.txt          # Python lockfile (see Install)
+├── requirements.txt
 └── README.md
 ```
 
-**Not in git:** `.venv/`, `models/`, `generated/`, `apps/web/node_modules/`, `apps/web/.next/`, `.env` / `.env.local`, local `*.jpg` outputs.
+---
 
-## Quick start (API + web)
+## A. Local Mac (develop & test)
 
-### 1. Python inference API
-
-From the repository root:
+### 1. One-time setup
 
 ```bash
+cd image-sd
 python -m venv .venv
 source .venv/bin/activate
-uv pip install -r requirements.txt
-uv pip install diffusers uvicorn accelerate   # if not already present in your env
+pip install -r requirements.txt
+pip install diffusers uvicorn accelerate
 ```
 
-Download weights into `./models/sdxl-base` (see [Download model](#download-model-locally)).
-
-```bash
-make test-integration
-make run
-```
-
-API: `http://127.0.0.1:8001` — docs at `/docs`, health at `/health`.
-
-### 2. Next.js web app
-
-In a second terminal:
-
-```bash
-cd apps/web
-cp .env.example .env.local   # adjust SDXL_API_URL / SDXL_API_KEY if needed
-npm install
-npm run dev
-```
-
-Open `http://localhost:3000`, enter a prompt, and generate. The UI calls `/api/generate`, which forwards to the inference API with `X-API-Key` on the server.
-
-## System flow (today)
-
-**Single shot:** browser → Next proxy → `POST /generate` → tier policy → SDXL → Base64 JSON.
-
-**Correction loop:** `POST /jobs` → worker runs generate → evaluate → bump tier if needed → `GET /jobs/{id}` when `converged` or `failed`. See [ARCHITECTURE.md](./ARCHITECTURE.md#correction-loop-first-mvp).
-
-```mermaid
-flowchart LR
-    Browser --> Next["apps/web"]
-    Next --> Proxy["Route Handler /api/generate"]
-    Proxy --> API["FastAPI /generate"]
-    API --> Tier["router.apply_quality_tier"]
-    Tier --> Engine["SDXLEngine"]
-    Engine --> MPS["MPS / models/sdxl-base"]
-    MPS --> API
-    API --> Proxy
-    Proxy --> Browser
-```
-
-## Requirements
-
-- macOS with Apple Silicon (MVP target)
-- Python 3.12+ in `.venv` at repo root
-- Node.js 20+ for `apps/web`
-- Local model files under `./models/sdxl-base`
-
-## Install dependencies (Python)
-
-With `uv` and an activated `.venv`:
-
-```bash
-uv pip install -r requirements.txt
-```
-
-The root `requirements.txt` is a broad environment lockfile. Inference needs **diffusers** and **uvicorn**; install them if imports fail:
-
-```bash
-uv pip install diffusers uvicorn accelerate
-```
-
-Minimal inference-only set (fresh venv):
-
-```bash
-uv pip install fastapi uvicorn torch diffusers transformers accelerate pydantic pillow huggingface_hub httpx requests
-```
-
-## Download model locally
-
-Weights are **not** in git. Each machine needs **SDXL base 1.0** at `./models/sdxl-base`:
+Download model (once):
 
 ```bash
 python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='stabilityai/stable-diffusion-xl-base-1.0', local_dir='./models/sdxl-base', allow_patterns=['model_index.json','scheduler/*','tokenizer/*','tokenizer_2/*','text_encoder/config.json','text_encoder/model.fp16.safetensors','text_encoder_2/config.json','text_encoder_2/model.fp16.safetensors','vae/config.json','vae/diffusion_pytorch_model.fp16.safetensors','unet/config.json','unet/diffusion_pytorch_model.fp16.safetensors'])"
 ```
 
-**Note:** Defaults and `quality_tier` profiles are tuned for **base SDXL** (more steps, higher CFG). `/health` may still report `"optimization": "lightning"` — that field is legacy; actual weights are base 1.0.
-
-Override model path: `SDXL_MODEL_PATH=/path/to/weights make run`.
-
-## Start the inference server
+### 2. Run inference API
 
 ```bash
+source .venv/bin/activate
+export GENERATION_TIMEOUT_SECONDS=300   # recommended for balanced/quality tiers
+make test-integration
 make run
 ```
 
-Or manually:
+- API: http://127.0.0.1:8001  
+- Health: `curl http://127.0.0.1:8001/health`  
+- Key: `dev-local-key` (header `X-API-Key`)
 
-```bash
-cd services/inference-api && source ../../.venv/bin/activate && uvicorn main:app --host 127.0.0.1 --port 8001 --reload
-```
+### 3. Run web UI
 
-Default port **8001** (`PORT=8000 make run` to override).
-
-## Health check
-
-```bash
-curl http://127.0.0.1:8001/health
-```
-
-Example:
-
-```json
-{"status":"healthy","engine":"mps","backend":"diffusers","optimization":"lightning"}
-```
-
-## Metrics
-
-```bash
-curl http://127.0.0.1:8001/metrics -H "X-API-Key: dev-local-key"
-```
-
-## API key authentication
-
-- `/generate` and `/metrics` require header `X-API-Key`.
-- Default dev key: `dev-local-key` (override with `SDXL_API_KEY` before `make run`).
-- Next.js reads the same values from `apps/web/.env.local` (`SDXL_API_KEY`, `SDXL_API_URL`) — never expose the key to the browser.
-
-## Generate an image
-
-### With `quality_tier` (recommended for base SDXL)
-
-The server sets `steps` and `guidance_scale` from `services/inference-api/router.py`:
-
-| Tier | Steps | Guidance |
-|------|-------|----------|
-| `fast` | 12 | 5.0 |
-| `balanced` | 25 | 6.0 |
-| `quality` | 35 | 7.0 |
-
-```bash
-curl -sS -X POST "http://127.0.0.1:8001/generate" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-local-key" \
-  -d '{
-    "prompt": "a cinematic portrait of a tiger in rain, ultra detailed",
-    "quality_tier": "balanced",
-    "width": 1024,
-    "height": 1024,
-    "seed": 1234
-  }'
-```
-
-### Explicit steps (no tier override)
-
-```bash
-curl -sS -X POST "http://127.0.0.1:8001/generate" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-local-key" \
-  -d '{
-    "prompt": "a red apple on a wooden table",
-    "steps": 25,
-    "guidance_scale": 6.0,
-    "scheduler": "dpm++2m_karras"
-  }'
-```
-
-Success responses include `image_base64` and `metadata` (`steps`, `guidance_scale`, `model_id`, `quality_tier`, `seed`, …). Responses include header `X-Request-ID`.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GENERATION_TIMEOUT_SECONDS` | `90` | Wall-clock cap per generate step (jobs run multiple steps) |
-| `SDXL_API_KEY` | `dev-local-key` | API key for `/generate`, `/metrics`, `/jobs` |
-| `SDXL_MODEL_PATH` | `<repo>/models/sdxl-base` | Weight directory |
-| `APP_ENV` | `dev` | `dev` includes error `details` on 500 |
-| `CLIP_MODEL_ID` | `openai/clip-vit-base-patch32` | Hugging Face model for job reference eval |
-| `CLIP_DEVICE` | `cpu` | Device for CLIP (keep `cpu` on Mac if MPS busy with SDXL) |
-| `PRODUCT_SIMILARITY_MIN` | `0.85` | Default CLIP threshold when `goal.product_similarity_min` unset |
-
-On Mac, use `export GENERATION_TIMEOUT_SECONDS=300` before `make run` when using `balanced` / `quality` tiers or multi-step jobs.
-
-Watch logs for `generation_timeout` (504). Note: timeout ends the HTTP wait; GPU work may still finish in the background (see ARCHITECTURE.md).
-
-## Request fields
-
-| Field | Description |
-|-------|-------------|
-| `prompt` | Required text prompt |
-| `negative_prompt` | Optional; default anti-artifact string |
-| `seed` | Optional; random if omitted |
-| `width` / `height` | 512–1536, multiple of 8; default 1024 |
-| `steps` | 1–40; default 4 (use tier or raise for base SDXL) |
-| `guidance_scale` | 0.0–12.0; default 1.0 |
-| `quality_tier` | Optional: `fast`, `balanced`, `quality` — overrides steps/CFG |
-| `clip_skip` | 1–4; default 2 |
-| `scheduler` | `dpm++2m_karras` or `euler` |
-
-Unknown fields (e.g. `lora_path`) return **422**.
-
-## Correction jobs (`POST /jobs`)
-
-Goal-seeking generation with bounded retries (policy correction, not LLM planner).
-
-```bash
-# Create job (202) — tier-only correction
-curl -sS -X POST "http://127.0.0.1:8001/jobs" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-local-key" \
-  -d '{
-    "goal": { "realism": "high" },
-    "prompt": "photorealistic portrait, soft natural light",
-    "quality_tier": "fast",
-    "max_iterations": 3
-  }'
-
-# Product reference (CLIP similarity) — set preserve_product or product_similarity_min
-# reference_image_base64: base64-encoded JPEG of your product SKU photo
-curl -sS -X POST "http://127.0.0.1:8001/jobs" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-local-key" \
-  -d '{
-    "goal": { "preserve_product": true, "product_similarity_min": 0.85 },
-    "prompt": "luxury ring on velvet, studio lighting",
-    "quality_tier": "fast",
-    "max_iterations": 3,
-    "reference_image_base64": "<BASE64_JPEG>"
-  }'
-
-# Poll (replace JOB_ID)
-curl -sS "http://127.0.0.1:8001/jobs/JOB_ID" -H "X-API-Key: dev-local-key"
-```
-
-| Job `status` | Meaning |
-|--------------|---------|
-| `queued` / `running` | In progress |
-| `converged` | Evaluator passed; `image_base64` set |
-| `failed` | `error_code`: `convergence_failed` |
-| `error` | e.g. `generation_timeout`, `capacity_reached` |
-
-Response includes `iterations[]` (attempt, `issues`, `clip_similarity` when ref provided, tier/steps per try).
-
-**Evaluator note:** v1 CLIP measures reference match, not full scene correctness. Tier bump is a coarse correction; inpaint pipeline is planned for localized fixes.
-
-## Backpressure and rate limits
-
-- **Capacity:** `MAX_INFLIGHT_GENERATIONS=1` → second concurrent `/generate` gets **429** `capacity_reached` with `Retry-After: 5`.
-- **Rate limit:** per API key, sliding window → **429** `rate_limited`.
-
-## Save the returned image
-
-```bash
-cd services/inference-api && source ../../.venv/bin/activate && python client.py
-```
-
-Or decode JSON with Python/`base64` (outputs are gitignored if written beside the service).
-
-## Integration tests
-
-```bash
-make test-integration
-```
-
-Runs `test_integration_api.py` and `test_router.py` with **mocked** GPU work.
-
-## Product benchmark (hypothesis test)
-
-Prove whether the **job loop** beats **single-shot** `/generate` on CLIP vs a product reference (not human QA).
-
-1. Add SKU JPEGs under `benchmarks/product_similarity/fixtures/` (see `manifest.json`).
-2. `make run` with `GENERATION_TIMEOUT_SECONDS=300`.
-3. `make benchmark-product`
-4. Read `benchmarks/product_similarity/results/latest.md`.
-
-Coach guide: [benchmarks/product_similarity/README.md](./benchmarks/product_similarity/README.md).
-
-## Web app (`apps/web`)
-
-From repo root, in a second terminal:
+**Use port 3001** if you have an SSH tunnel on 3000 to a VM.
 
 ```bash
 cd apps/web
 cp .env.example .env.local
 npm install
-npm run dev
+npm run dev:local
 ```
 
-- UI: `http://localhost:3000`
-- Server route `src/app/api/generate/route.ts` proxies to `SDXL_API_URL` with `X-API-Key` from env
-- Client: `src/components/generate-form.tsx` — extend the POST body with `quality_tier` when you want tiered generation
+Open **http://localhost:3001** — lime header, bottom **Generate** dock, **Product job** tab.
 
-## Collaboration notes
+| Mode | What it does |
+|------|----------------|
+| Quick generate | `POST /api/generate` → single SDXL image |
+| Product job | `POST /api/jobs` → generate + CLIP eval + tier/inpaint correction |
 
-- Contract source of truth: `schemas.py` + integration tests.
-- Inference only in `engine.py` (and future engine modules per `model_id`).
-- Goal/intent types (`VisualGoal`) stay separate from adapter knobs (`steps`, `scheduler`).
-- Contract changes → update tests, this README, and `ARCHITECTURE.md` when behavior meaning changes.
+**Important:** Reference JPEG is used for **CLIP scoring**, not pixel-perfect product copy. See [ARCHITECTURE.md](./ARCHITECTURE.md).
+
+---
+
+## B. Spheron GPU VM (production test)
+
+Run **`make spheron-*` on your Mac only** — not inside the VM SSH session.
+
+### First time on a fresh VM
+
+```bash
+# Mac
+cd image-sd
+make spheron-sync
+ssh -i ~/.ssh/id_ed25519 ubuntu@<VM_IP>
+```
+
+On the VM:
+
+```bash
+cd ~/image-sd
+bash scripts/spheron_setup.sh          # CUDA, venv, download models
+bash scripts/spheron_restart_api.sh   # API on :8001
+bash scripts/spheron_deploy_web.sh    # production web on :3000
+```
+
+Or one-shot bootstrap (setup + API + smoke image):
+
+```bash
+bash scripts/spheron_vm_bootstrap.sh
+```
+
+### Every code update (Mac → VM)
+
+```bash
+# Mac — sync code + restart API + rebuild web
+make spheron-deploy
+```
+
+Or on the VM after you synced from Mac:
+
+```bash
+cd ~/image-sd
+make deploy-api
+make deploy-web
+```
+
+### Use the UI from your Mac
+
+**Terminal 1** — tunnel (do not use `http://0.0.0.0:3000` in the browser):
+
+```bash
+ssh -L 3000:127.0.0.1:3000 -i ~/.ssh/id_ed25519 ubuntu@<VM_IP>
+```
+
+**Browser:** http://127.0.0.1:3000 — hard refresh `Cmd+Shift+R`
+
+**Terminal 2** — optional local UI against VM API:
+
+```bash
+# Only if you are NOT tunneling 3000, or use 3001 locally
+cd apps/web && npm run dev:local
+```
+
+### Verify deployment
+
+On VM:
+
+```bash
+curl -s http://127.0.0.1:8001/health
+curl -s http://127.0.0.1:3000/ | grep -oE 'Start creating|Generate frame' | head -1
+# Want: Start creating  (new UI). Not: Generate frame  (old UI)
+```
+
+Logs:
+
+```bash
+tail -f /tmp/sdxl-api.log
+tail -f /tmp/visual-studio-web.log
+```
+
+### GPU benchmark (optional)
+
+```bash
+# Mac
+make spheron-benchmark
+```
+
+---
+
+## Makefile reference
+
+| Target | Where | Action |
+|--------|-------|--------|
+| `make clean` | Mac/VM | Remove `.next`, benchmark results, caches |
+| `make run` | Mac | Dev API with reload |
+| `make test-integration` | Mac/VM | Mocked API tests |
+| `make benchmark-product` | Mac | CLIP benchmark (API must be up) |
+| `make spheron-sync` | **Mac** | Rsync code to VM |
+| `make spheron-deploy` | **Mac** | Sync + restart API + rebuild web on VM |
+| `make deploy-api` | **VM** | Restart inference API |
+| `make deploy-web` | **VM** | Clean build + `next start` on :3000 |
+
+---
+
+## Scripts
+
+| Script | Run on | Purpose |
+|--------|--------|---------|
+| `scripts/clean.sh` | Mac/VM | Delete build artifacts |
+| `scripts/spheron_setup.sh` | VM | First-time CUDA + model download |
+| `scripts/spheron_restart_api.sh` | VM | Restart API (waits for `/health`) |
+| `scripts/spheron_deploy_web.sh` | VM | Kill :3000, `npm run build`, `next start` |
+| `scripts/spheron_vm_bootstrap.sh` | VM | setup + API + smoke generate |
+| `scripts/spheron_generate.py` | VM/Mac | One `/generate` smoke test |
+| `scripts/run_product_benchmark.py` | Mac/VM | Product CLIP benchmark |
+| `scripts/run_product_job.py` | Mac/VM | CLI product job with reference file |
+
+---
+
+## API quick reference
+
+- `POST /generate` — single image (`quality_tier`: fast / balanced / quality)
+- `POST /jobs` — correction loop (`goal.preserve_product`, `reference_image_base64`, optional `goal.use_inpaint_correction`)
+- `POST /inpaint` — mask + init image
+- `GET /jobs/{id}` — poll job status
+- Auth: `X-API-Key: dev-local-key`
+
+Example product job:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8001/jobs" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-local-key" \
+  -d '{
+    "goal": {
+      "preserve_product": true,
+      "product_similarity_min": 0.85,
+      "use_inpaint_correction": true
+    },
+    "prompt": "luxury ring on black velvet, studio lighting",
+    "quality_tier": "fast",
+    "max_iterations": 3,
+    "reference_image_base64": "<BASE64_JPEG>"
+  }'
+```
+
+---
 
 ## Common issues
 
-**Missing model files** — ensure `models/sdxl-base/model_index.json` and fp16 safetensors exist (see download command).
+| Symptom | Fix |
+|---------|-----|
+| Old purple sidebar UI | VM still on old `next` process — `make deploy-web` on VM; browser http://127.0.0.1:3000 + hard refresh |
+| `422 use_inpaint_correction` | API not restarted — `make deploy-api` on VM after sync |
+| `EADDRINUSE :3000` | `fuser -k 3000/tcp` then `make deploy-web` |
+| `make spheron-sync` fails on VM | Run spheron targets from **Mac**, not inside SSH |
+| Mac shows old UI on :3000 | SSH tunnel points to VM — use `npm run dev:local` on **:3001** |
+| `/_next/static` 500 | Stale `.next` — `make deploy-web` (deletes `.next` and rebuilds) |
+| Reference ≠ output ring | Expected today — CLIP only; see ARCHITECTURE.md |
 
-**504 timeout** — lower tier, reduce steps, or raise `GENERATION_TIMEOUT_SECONDS` for local dev.
+---
 
-**Blurry images with default `steps: 4`** — you are on **base** weights; use `quality_tier: "balanced"` or higher steps/CFG.
+## Env vars (inference)
 
-**Next cannot reach API** — inference must be on `127.0.0.1:8001`; check `apps/web/.env.local`.
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `DEVICE` | auto | `cuda` on VM, `mps` on Mac |
+| `GENERATION_TIMEOUT_SECONDS` | `90` | Use `300` on GPU / quality tiers |
+| `SDXL_API_KEY` | `dev-local-key` | Match `apps/web/.env.local` |
+| `SDXL_MODEL_PATH` | `./models/sdxl-base` | |
 
-**`GET /` returns 404** — use `/health`, `/docs`, or `POST /generate`.
+Web proxy (`apps/web/.env.local`): `SDXL_API_URL`, `SDXL_JOBS_URL`, `SDXL_API_KEY`, `SDXL_FETCH_TIMEOUT_MS` — see `.env.example`.

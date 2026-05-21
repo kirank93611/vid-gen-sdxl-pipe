@@ -14,6 +14,7 @@ from schemas import (
     ErrorResponse,
     GenerateRequest,
     GenerateResponse,
+    InpaintRequest,
     JobCreateRequest,
     JobCreateResponse,
     JobStatusResponse,
@@ -21,8 +22,9 @@ from schemas import (
 from registry import EngineRegistry
 from router import apply_quality_tier
 import jobs as jobs_module
-from generation_service import generate_image_bytes
-from sdxl_adapter import build_metadata
+from generation_service import generate_image_bytes, inpaint_image_bytes
+from device import get_runtime_device
+from sdxl_adapter import build_metadata, effective_inpaint_request
 
 # Repo root: .../image-sd (models live at <repo>/models/sdxl-base)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -76,8 +78,14 @@ _metrics_lock = threading.Lock()
 
 MAX_INFLIGHT_GENERATIONS = 1
 GENERATION_TIMEOUT_SECONDS = int(os.getenv("GENERATION_TIMEOUT_SECONDS", "90"))
+INPAINT_STRENGTH = float(os.getenv("INPAINT_STRENGTH", "0.85"))
 _generate_semaphore = threading.Semaphore(MAX_INFLIGHT_GENERATIONS)
-jobs_module.configure(registry, GENERATION_TIMEOUT_SECONDS, _generate_semaphore)
+jobs_module.configure(
+    registry,
+    GENERATION_TIMEOUT_SECONDS,
+    _generate_semaphore,
+    inpaint_strength=INPAINT_STRENGTH,
+)
 
 _metrics: dict[str, int | float] = {
     "requests_total": 0,
@@ -326,6 +334,121 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
     )
 
 
+@app.post("/inpaint", response_model=GenerateResponse, responses={
+    429: {"model": ErrorResponse},
+    500: {"model": ErrorResponse},
+    504: {"model": ErrorResponse},
+})
+async def inpaint(
+    payload: InpaintRequest,
+    http_request: Request,
+) -> GenerateResponse | JSONResponse:
+    """Repaint masked region of an existing image (SDXL inpaint pipeline)."""
+    unauthorized = _require_api_key(http_request)
+    if unauthorized is not None:
+        return unauthorized
+
+    request_id = getattr(http_request.state, "request_id", "unknown")
+    provided_api_key = http_request.headers.get(API_KEY_HEADER, "")
+    if not _check_and_record_rate_limit(provided_api_key):
+        response = JSONResponse(
+            status_code=429,
+            content={
+                "status": "error",
+                "error_code": "rate_limited",
+                "message": "Rate limit exceeded",
+                "request_id": request_id,
+            },
+        )
+        response.headers["Retry-After"] = str(RATE_LIMIT_WINDOW_SECONDS)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    acquired = _generate_semaphore.acquire(blocking=False)
+    if not acquired:
+        response = JSONResponse(
+            status_code=429,
+            content={
+                "status": "error",
+                "error_code": "capacity_reached",
+                "message": "GPU busy, retry later",
+                "request_id": request_id,
+            },
+        )
+        response.headers["Retry-After"] = "5"
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    effective, model_id = effective_inpaint_request(payload)
+    gen_payload = effective
+    try:
+        registry.get_engine(model_id)
+    except ValueError as exc:
+        _generate_semaphore.release()
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "error",
+                "error_code": "unsupported_model_id",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+
+    try:
+        init_bytes = base64.b64decode(payload.image_base64, validate=True)
+        mask_bytes = base64.b64decode(payload.mask_base64, validate=True)
+    except Exception:
+        _generate_semaphore.release()
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "error",
+                "error_code": "invalid_request",
+                "message": "Invalid image_base64 or mask_base64",
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+
+    start = time.perf_counter()
+    try:
+        image_bytes, used_seed, effective, model_id = await inpaint_image_bytes(
+            gen_payload,
+            init_image_bytes=init_bytes,
+            mask_bytes=mask_bytes,
+            strength=payload.strength,
+            registry=registry,
+            timeout_seconds=GENERATION_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        response = JSONResponse(
+            status_code=504,
+            content={
+                "status": "error",
+                "error_code": "generation_timeout",
+                "message": "Inpaint timed out",
+                "request_id": request_id,
+            },
+        )
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception:
+        raise
+    finally:
+        _generate_semaphore.release()
+
+    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+    meta = build_metadata(effective, gen_payload, model_id, used_seed)
+    meta["inpaint_strength"] = payload.strength
+    return GenerateResponse(
+        status="success",
+        image_base64=image_base64,
+        metadata=meta,
+    )
+
+
 @app.post(
     "/jobs",
     response_model=JobCreateResponse,
@@ -425,10 +548,10 @@ async def metrics(http_request: Request) -> dict[str, int | float] | JSONRespons
 async def health_check() -> dict[str, str]:
     """Engine and hardware status check."""
     return {
-        "status": "healthy", 
-        "engine": "mps", 
+        "status": "healthy",
+        "engine": get_runtime_device(),
         "backend": "diffusers",
-        "optimization": "lightning"
+        "optimization": "lightning",
     }
 
 from collections import deque

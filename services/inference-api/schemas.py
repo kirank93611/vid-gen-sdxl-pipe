@@ -101,6 +101,28 @@ class VisualGoal(BaseModel):
         le=1.0,
         description="Min CLIP similarity vs reference_image when provided (default 0.85).",
     )
+    use_inpaint_correction: bool | None = Field(
+        default=None,
+        description="When true, job may run SDXL inpaint (mask or auto center mask) after tier bump.",
+    )
+
+
+class InpaintRequest(BaseModel):
+    """Inpaint a region of an existing image (white = repaint in mask_image)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str
+    image_base64: str = Field(..., description="Init RGB image (JPEG/PNG Base64).")
+    mask_base64: str = Field(..., description="Grayscale mask; white pixels are inpainted.")
+    negative_prompt: str = Field(
+        default="blurry, low quality, deformed, ugly, bad anatomy, glitter, gold dust",
+    )
+    quality_tier: Literal["fast", "balanced", "quality"] | None = "fast"
+    strength: Annotated[float, Field(default=0.85, ge=0.1, le=1.0)]
+    seed: int | None = None
+    width: Annotated[int, Field(default=1024, ge=512, le=1536, multiple_of=8)]
+    height: Annotated[int, Field(default=1024, ge=512, le=1536, multiple_of=8)]
 
 
 class EvalResult(BaseModel):
@@ -124,6 +146,7 @@ class JobIterationRecord(BaseModel):
     guidance_scale: float | None = None
     seed: int | None = None
     clip_similarity: float | None = None
+    correction: Literal["generate", "inpaint", "tier_bump"] | None = None
 
 
 class JobCreateRequest(BaseModel):
@@ -147,6 +170,10 @@ class JobCreateRequest(BaseModel):
     reference_image_base64: str | None = Field(
         default=None,
         description="Optional product/reference JPEG (Base64) for CLIP similarity eval.",
+    )
+    mask_base64: str | None = Field(
+        default=None,
+        description="Optional inpaint mask (white=repaint). Auto center mask if goal.use_inpaint_correction.",
     )
 
 

@@ -7,7 +7,8 @@
     "goal": {
       "preserve_product": true,
       "product_similarity_min": 0.85,
-      "task": "product_composite"
+      "task": "product_composite",
+      "use_inpaint_correction": true
     }
   },
   "cases": [

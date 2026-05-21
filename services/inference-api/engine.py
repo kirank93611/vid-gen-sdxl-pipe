@@ -2,101 +2,98 @@ import torch
 import threading
 import io
 import os
-from typing import Annotated, Callable, Any
+from typing import Callable, Any
+from PIL import Image
 from diffusers import (
-    StableDiffusionXLPipeline, 
-    EulerDiscreteScheduler, 
-    DPMSolverMultistepScheduler
+    StableDiffusionXLPipeline,
+    StableDiffusionXLInpaintPipeline,
+    EulerDiscreteScheduler,
+    DPMSolverMultistepScheduler,
 )
 from schemas import GenerateRequest
+from device import resolve_torch_device
 
-# PEP 604 & 585 for clean configuration
+
+class GenerationCancelledError(Exception):
+    """Cooperative stop: diffusion interrupted between steps (timeout / shutdown)."""
+
+
 SchedulerFactory = Callable[[dict[str, Any]], Any]
 
 SCHEDULERS: dict[str, SchedulerFactory] = {
-    "dpm++2m_karras": lambda cfg: DPMSolverMultistepScheduler.from_config(cfg, use_karras_sigmas=True),
-    "euler":          lambda cfg: EulerDiscreteScheduler.from_config(cfg),
+    "dpm++2m_karras": lambda cfg: DPMSolverMultistepScheduler.from_config(
+        cfg, use_karras_sigmas=True
+    ),
+    "euler": lambda cfg: EulerDiscreteScheduler.from_config(cfg),
 }
+
 
 class SDXLEngine:
     """
-    Stateful engine for SDXL-Lightning inference.
-    Handles MPS device management and request-scoped pipeline mutation.
-
-    Architecture intent:
-    - Keep all model/runtime concerns here (diffusers, scheduler, MPS).
-    - Keep API concerns out of this class (no FastAPI Request/Response).
-    - Expose a small surface: load model once, generate per request.
+    Stateful engine for SDXL inference on cuda, mps, or cpu.
     """
-    def __init__(self, model_path: str) -> None:
-        # Local filesystem path to SDXL weights (no runtime downloading).
+
+    def __init__(self, model_path: str, device: str | None = None) -> None:
         self.model_path = model_path
-        # Diffusers pipeline object; initialized in load_model().
+        self.device = device or resolve_torch_device()
         self.pipeline: StableDiffusionXLPipeline | None = None
-        # Protects mutable pipeline state during concurrent requests.
+        self.inpaint_pipeline: StableDiffusionXLInpaintPipeline | None = None
         self._lock = threading.Lock()
-        # Eager load at process startup so first request is not delayed.
         self.load_model()
 
     def load_model(self) -> None:
-        """
-        Initialize the SDXL pipeline on Apple Silicon (MPS).
+        print(f"Loading SDXL from {self.model_path} on device={self.device}")
 
-        Side effects:
-        - Sets offline Hugging Face env flags.
-        - Allocates model weights on MPS device.
-        - Sets a default scheduler.
-        """
-        print(f"Loading SDXL-Lightning from {self.model_path}")
-        
-        # Enforce offline mode to prevent network hangs during inference
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
+        dtype = torch.float16 if self.device in ("cuda", "mps") else torch.float32
+
         self.pipeline = StableDiffusionXLPipeline.from_pretrained(
             self.model_path,
-            torch_dtype=torch.float16,
-            variant="fp16",
+            torch_dtype=dtype,
+            variant="fp16" if dtype == torch.float16 else None,
             use_safetensors=True,
             local_files_only=True,
-        ).to("mps")
+        ).to(self.device)
 
-        # Set initial scheduler
-        self.pipeline.scheduler = SCHEDULERS["dpm++2m_karras"](self.pipeline.scheduler.config)
-        print("Model initialized on MPS.")
+        self.pipeline.scheduler = SCHEDULERS["dpm++2m_karras"](
+            self.pipeline.scheduler.config
+        )
+        print(f"Model initialized on {self.device}.")
 
-    def generate(self, req: GenerateRequest) -> tuple[bytes, int]:
-        """
-        Execute one image generation request on MPS.
-
-        Args:
-            req: Validated generation request from API schema.
-
-        Returns:
-            Tuple of:
-            - raw JPEG bytes
-            - seed used for deterministic reproducibility
-        """
-        # Guardrail: only allow known scheduler keys.
+    def generate(
+        self,
+        req: GenerateRequest,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[bytes, int]:
         if req.scheduler not in SCHEDULERS:
             raise ValueError(f"Unsupported scheduler: {req.scheduler}")
 
-        # If caller did not provide a seed, create a random one.
         seed = req.seed if req.seed is not None else torch.randint(0, 2**32 - 1, (1,)).item()
-        # Torch generator tied to MPS device for deterministic sampling.
-        generator = torch.Generator(device="mps").manual_seed(seed)
+        generator = torch.Generator(device=self.device).manual_seed(seed)
 
         with self._lock:
-            # Reconfigure pipeline for specific request context
-            self.pipeline.scheduler = SCHEDULERS[req.scheduler](self.pipeline.scheduler.config)
-            self.pipeline.scheduler.set_timesteps(req.steps, device="mps")
+            self.pipeline.scheduler = SCHEDULERS[req.scheduler](
+                self.pipeline.scheduler.config
+            )
+            self.pipeline.scheduler.set_timesteps(req.steps, device=self.device)
 
-            # Apply Clip Skip for style control
             original_layers = self.pipeline.text_encoder.config.num_hidden_layers
-            self.pipeline.text_encoder.config.num_hidden_layers -= (req.clip_skip - 1)
+            self.pipeline.text_encoder.config.num_hidden_layers -= req.clip_skip - 1
+
+            def _on_step_end(
+                _pipe: StableDiffusionXLPipeline,
+                _step_index: int,
+                _timestep: int,
+                callback_kwargs: dict[str, Any],
+            ) -> dict[str, Any]:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise GenerationCancelledError("cancelled")
+                return callback_kwargs
 
             try:
-                # SDXL-Lightning optimization: 4 steps, low guidance
                 output = self.pipeline(
                     prompt=req.prompt,
                     negative_prompt=req.negative_prompt,
@@ -105,13 +102,87 @@ class SDXLEngine:
                     num_inference_steps=req.steps,
                     guidance_scale=req.guidance_scale,
                     generator=generator,
+                    callback_on_step_end=_on_step_end if cancel_event is not None else None,
                 ).images[0]
+            except GenerationCancelledError:
+                raise
             finally:
-                # Restore state for the next request in the pool
                 self.pipeline.text_encoder.config.num_hidden_layers = original_layers
 
-        # Buffer conversion for stateless response
         buffer = io.BytesIO()
         output.save(buffer, format="JPEG", quality=90)
-        # Return bytes instead of file paths to keep API stateless.
+        return buffer.getvalue(), seed
+
+    def _ensure_inpaint_pipeline(self) -> StableDiffusionXLInpaintPipeline:
+        if self.inpaint_pipeline is not None:
+            return self.inpaint_pipeline
+
+        dtype = torch.float16 if self.device in ("cuda", "mps") else torch.float32
+        self.inpaint_pipeline = StableDiffusionXLInpaintPipeline.from_pretrained(
+            self.model_path,
+            torch_dtype=dtype,
+            variant="fp16" if dtype == torch.float16 else None,
+            use_safetensors=True,
+            local_files_only=True,
+        ).to(self.device)
+        self.inpaint_pipeline.scheduler = SCHEDULERS["dpm++2m_karras"](
+            self.inpaint_pipeline.scheduler.config
+        )
+        return self.inpaint_pipeline
+
+    def inpaint(
+        self,
+        req: GenerateRequest,
+        init_image: Image.Image,
+        mask_image: Image.Image,
+        *,
+        strength: float = 0.85,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[bytes, int]:
+        if req.scheduler not in SCHEDULERS:
+            raise ValueError(f"Unsupported scheduler: {req.scheduler}")
+
+        size = (req.width, req.height)
+        if init_image.size != size:
+            init_image = init_image.resize(size, Image.Resampling.LANCZOS)
+        if mask_image.size != size:
+            mask_image = mask_image.resize(size, Image.Resampling.LANCZOS)
+
+        seed = req.seed if req.seed is not None else torch.randint(0, 2**32 - 1, (1,)).item()
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        pipeline = self._ensure_inpaint_pipeline()
+
+        with self._lock:
+            pipeline.scheduler = SCHEDULERS[req.scheduler](pipeline.scheduler.config)
+            pipeline.scheduler.set_timesteps(req.steps, device=self.device)
+
+            def _on_step_end(
+                _pipe: StableDiffusionXLInpaintPipeline,
+                _step_index: int,
+                _timestep: int,
+                callback_kwargs: dict[str, Any],
+            ) -> dict[str, Any]:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise GenerationCancelledError("cancelled")
+                return callback_kwargs
+
+            try:
+                output = pipeline(
+                    prompt=req.prompt,
+                    negative_prompt=req.negative_prompt,
+                    image=init_image,
+                    mask_image=mask_image,
+                    width=req.width,
+                    height=req.height,
+                    num_inference_steps=req.steps,
+                    guidance_scale=req.guidance_scale,
+                    strength=strength,
+                    generator=generator,
+                    callback_on_step_end=_on_step_end if cancel_event is not None else None,
+                ).images[0]
+            except GenerationCancelledError:
+                raise
+
+        buffer = io.BytesIO()
+        output.save(buffer, format="JPEG", quality=90)
         return buffer.getvalue(), seed

@@ -17,8 +17,10 @@ flowchart TB
     end
 
     subgraph WebTier["apps/web — Next.js"]
-        Page[src/app/page.tsx + generate-form.tsx]
-        Proxy[src/app/api/generate/route.ts]
+        Page[src/app/page.tsx StudioEditor]
+        Explore[src/app/explore/page.tsx]
+        ProxyGen[src/app/api/generate/route.ts]
+        ProxyJobs[src/app/api/jobs/route.ts]
     end
 
     subgraph APITier["services/inference-api — FastAPI"]
@@ -36,15 +38,19 @@ flowchart TB
     end
 
     Browser --> Page
-    Page -->|POST /api/generate JSON| Proxy
-    Proxy -->|POST /generate + X-API-Key| MW
+    Browser --> Explore
+    Page -->|POST /api/generate or /api/jobs| ProxyGen
+    Page --> ProxyJobs
+    ProxyGen -->|POST /generate + X-API-Key| MW
+    ProxyJobs -->|POST/GET /jobs + X-API-Key| MW
     MW --> Routes
     Routes --> Schemas
     Routes --> Router
     Routes --> Registry
     Registry --> Engine
     Engine --> Weights
-    Proxy -.->|SDXL_API_URL SDXL_API_KEY| Env
+    ProxyGen -.->|SDXL_API_URL SDXL_API_KEY| Env
+    ProxyJobs -.->|SDXL_JOBS_URL| Env
 ```
 
 ---
@@ -147,8 +153,9 @@ classDiagram
 | `GET` | `/health` | No | `200` engine status JSON |
 | `GET` | `/metrics` | `X-API-Key` | `200` counters |
 | `POST` | `/generate` | `X-API-Key` | `200` / `401` / `422` / `429` / `500` / `504` |
-| `POST` | `/jobs` | `X-API-Key` | `202` / `401` / `429` |
+| `POST` | `/jobs` | `X-API-Key` | `202` / `401` / `422` / `429` |
 | `GET` | `/jobs/{job_id}` | `X-API-Key` | `200` / `401` / `404` |
+| `POST` | `/inpaint` | `X-API-Key` | `200` / `401` / `422` / `429` / `504` |
 | — | `/docs` | No | OpenAPI UI |
 
 ### 4.1 Stable `error_code` values (product surface)
@@ -184,8 +191,14 @@ classDiagram
 | `SDXL_API_KEY` | `main.py` | `dev-local-key` | Expected `X-API-Key` |
 | `APP_ENV` | `main.py` | `dev` | Include `details` on 500 if `dev` |
 | `PORT` | Makefile | `8001` | Uvicorn port |
-| `SDXL_API_URL` | `apps/web` route | `http://127.0.0.1:8001/generate` | Upstream URL |
+| `SDXL_API_URL` | `apps/web` route | `http://127.0.0.1:8001/generate` | Upstream `/generate` |
+| `SDXL_JOBS_URL` | `apps/web` route | `http://127.0.0.1:8001/jobs` | Upstream `/jobs` base |
 | `SDXL_API_KEY` | `apps/web` route | `dev-local-key` | Server-side proxy key |
+| `SDXL_FETCH_TIMEOUT_MS` | `apps/web` route | `600000` | Proxy read timeout |
+| `DEVICE` | `device.py` | auto (`cuda`/`mps`/`cpu`) | Inference device |
+| `INPAINT_STRENGTH` | `main.py` / jobs | `0.85` | SDXL inpaint denoise strength |
+| `GENERATION_TIMEOUT_SECONDS` | `main.py`, jobs | `90` | Wall-clock per GPU step |
+| `GENERATION_CANCEL_GRACE_SECONDS` | `generation_service.py` | `120` | Drain GPU thread after timeout |
 
 ### Constants (`main.py`)
 
@@ -318,7 +331,7 @@ flowchart TD
 
 ```mermaid
 sequenceDiagram
-    participant UI as generate-form.tsx
+    participant UI as StudioEditor + generation-dock
     participant RH as POST /api/generate
     participant API as FastAPI /generate
 
@@ -345,20 +358,22 @@ flowchart LR
         D2[main gates + metrics]
         D3[router quality_tier]
         D4[SDXLEngine MPS]
-        D5[Next proxy + form]
+        D5[Next proxy + studio UI]
     end
 
     subgraph Done2["Also implemented"]
         D6[EngineRegistry lazy load]
         D7[POST /jobs + GET /jobs/id]
         D8[evaluator + correction loop]
+        D9[POST /inpaint + job inpaint step]
+        D10[DEVICE env + spheron deploy scripts]
     end
 
     subgraph Planned["LLD target"]
-        P1[inpaint engine + mask pipeline]
+        P1[reference-conditioned gen IP-Adapter]
         P2[VLM rubric evaluator]
         P3[planner over tools]
-        P4[DEVICE=cuda Spheron]
+        P4[persisted jobs + artifact URLs]
     end
 
     Done --> Done2
@@ -375,13 +390,16 @@ In-process worker (`jobs.py`); state is **lost on process restart**.
 
 | Method | Path | Success | Notes |
 |--------|------|---------|-------|
-| POST | `/jobs` | 202 | Body: `JobCreateRequest` (`goal`, `prompt`, `quality_tier`, `max_iterations`) |
+| POST | `/jobs` | 202 | Body: `JobCreateRequest` |
 | GET | `/jobs/{job_id}` | 200 | `JobStatusResponse`; 404 `job_not_found` |
+| POST | `/inpaint` | 200 | Body: `InpaintRequest` (`image_base64`, `mask_base64`, `prompt`, …) |
 
 ### Schemas (additive)
 
-- `VisualGoal` — model-agnostic intent (`realism`, `preserve_product`, `task`)
-- `JobCreateRequest`, `JobCreateResponse`, `JobStatusResponse`, `JobIterationRecord`, `EvalResult`
+- `VisualGoal` — `realism`, `preserve_product`, `product_similarity_min`, `use_inpaint_correction`, `task`
+- `JobCreateRequest` — adds `reference_image_base64`, optional `mask_base64`
+- `JobCreateResponse`, `JobStatusResponse`, `JobIterationRecord` (`correction`: `generate` | `inpaint` | `tier_bump`), `EvalResult`
+- `InpaintRequest` — standalone inpaint endpoint
 
 ### Modules
 
@@ -389,10 +407,12 @@ In-process worker (`jobs.py`); state is **lost on process restart**.
 |--------|------|
 | `evaluator.py` | Rules + optional CLIP when `reference_image_base64` set |
 | `clip_evaluator.py` | Lazy CLIP (`CLIP_MODEL_ID`, `CLIP_DEVICE`, `PRODUCT_SIMILARITY_MIN`) |
-| `correction.py` | Maps `issues[]` → policy patch (tier bump); no raw CFG |
-| `sdxl_adapter.py` | `effective_request`, `build_metadata`, `bump_quality_tier` |
-| `generation_service.py` | Shared `generate_image_bytes` for `/generate` and jobs |
-| `capabilities.py` | Manifest: which `model_id` supports which capability |
+| `correction.py` | `apply_corrections`, `resolve_correction` (tier vs inpaint) |
+| `sdxl_adapter.py` | `effective_request`, `effective_inpaint_request`, `build_metadata` |
+| `generation_service.py` | `generate_image_bytes`, `inpaint_image_bytes` (single GPU worker) |
+| `image_utils.py` | Decode images/masks; `default_center_mask` for jobs |
+| `device.py` | `resolve_torch_device`, `get_runtime_device` |
+| `capabilities.py` | `text_to_image`, `quality_tier_routing`, `inpainting` |
 | `jobs.py` | Store, schedule, `generate → evaluate → correct` loop |
 
 ### Sequence
@@ -432,21 +452,24 @@ Integration tests patch `SDXLEngine.load_model` / `generate` at import time. Whe
 
 ```text
 services/inference-api/
-├── main.py               # HTTP, /generate, /jobs, metrics
-├── schemas.py            # Pydantic contracts (+ job/goal types)
+├── main.py               # HTTP: /generate, /jobs, /inpaint, metrics
+├── schemas.py            # Pydantic contracts (+ VisualGoal, InpaintRequest)
 ├── router.py             # quality_tier → steps/CFG/model_id
 ├── registry.py           # Engine lifecycle (lazy cache)
-├── sdxl_adapter.py       # Policy → effective GenerateRequest
-├── generation_service.py # Shared async generate
+├── sdxl_adapter.py       # Policy → effective request
+├── generation_service.py # generate + inpaint on GPU executor
 ├── evaluator.py          # Goal vs output (rules + CLIP)
 ├── clip_evaluator.py     # CLIP similarity (lazy load)
-├── correction.py         # issues → policy patch
-├── capabilities.py       # model_id capability manifest
+├── correction.py         # resolve_correction (tier / inpaint)
+├── image_utils.py        # Masks, decode helpers
+├── device.py             # DEVICE env
+├── capabilities.py       # Capability manifest
 ├── jobs.py               # Correction job store + worker
-├── engine.py             # diffusers SDXL on MPS
+├── engine.py             # SDXL txt2img + inpaint pipelines
 ├── client.py             # Sample HTTP client
 └── tests/
     ├── test_integration_api.py
+    ├── test_generation_service.py
     ├── test_router.py
     ├── test_evaluator.py
     ├── test_correction.py
@@ -460,7 +483,8 @@ services/inference-api/
 | Path | Role |
 |------|------|
 | `benchmarks/product_similarity/manifest.json` | Case list: `id`, `prompt`, `reference_path`, optional overrides |
-| `benchmarks/product_similarity/fixtures/` | Reference JPEGs (not in git until you add them) |
+| `benchmarks/product_similarity/fixtures/` | Reference JPEGs (e.g. ring, watch) |
+| `scripts/spheron_*.sh`, `scripts/clean.sh` | VM deploy + artifact cleanup — see README |
 | `scripts/run_product_benchmark.py` | HTTP client: baseline vs job, writes `results/latest.json` |
 | `make benchmark-product` | Runs script (requires live API + fixtures) |
 
