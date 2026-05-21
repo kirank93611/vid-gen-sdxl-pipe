@@ -44,6 +44,7 @@ models/
 
 # --- Generated / local outputs ---
 generated/
+benchmarks/product_similarity/results/
 **/test_output.jpg
 **/output.jpg
 services/inference-api/*.jpg

@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "description": "Product reference similarity benchmark. Add JPEGs under fixtures/ and set reference_path.",
+  "defaults": {
+    "quality_tier": "fast",
+    "max_iterations": 3,
+    "goal": {
+      "preserve_product": true,
+      "product_similarity_min": 0.85,
+      "task": "product_composite"
+    }
+  },
+  "cases": [
+    {
+      "id": "ring_velvet_studio",
+      "prompt": "luxury gold ring on black velvet, studio softbox lighting, photorealistic product photography",
+      "reference_path": "fixtures/ring_reference.jpg"
+    },
+    {
+      "id": "watch_hero",
+      "prompt": "premium wristwatch on marble surface, shallow depth of field, commercial hero shot",
+      "reference_path": "fixtures/watch_reference.jpg"
+    }
+  ]
+}

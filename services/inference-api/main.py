@@ -10,9 +10,19 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from schemas import GenerateRequest, GenerateResponse, ErrorResponse
+from schemas import (
+    ErrorResponse,
+    GenerateRequest,
+    GenerateResponse,
+    JobCreateRequest,
+    JobCreateResponse,
+    JobStatusResponse,
+)
 from registry import EngineRegistry
 from router import apply_quality_tier
+import jobs as jobs_module
+from generation_service import generate_image_bytes
+from sdxl_adapter import build_metadata
 
 # Repo root: .../image-sd (models live at <repo>/models/sdxl-base)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,12 +37,10 @@ app = FastAPI(
     description="Stateless SDXL-Lightning REST API optimized for M3 Pro."
 )
 
-# Shared global engine instance
-# Initialized at startup for Apple Silicon memory stability
 # Lazy engine cache; first /generate loads weights (see registry.get_engine).
 registry = EngineRegistry(
-    default_model_path = os.environ.get("SDXL_MODEL_PATH",str(_DEFAULT_MODEL))
-    )
+    default_model_path=os.environ.get("SDXL_MODEL_PATH", str(_DEFAULT_MODEL)),
+)
 logger = logging.getLogger("sdxl_api")
 
 
@@ -67,8 +75,9 @@ EXPECTED_API_KEY = os.getenv("SDXL_API_KEY", "dev-local-key")
 _metrics_lock = threading.Lock()
 
 MAX_INFLIGHT_GENERATIONS = 1
-GENERATION_TIMEOUT_SECONDS = 90
+GENERATION_TIMEOUT_SECONDS = int(os.getenv("GENERATION_TIMEOUT_SECONDS", "90"))
 _generate_semaphore = threading.Semaphore(MAX_INFLIGHT_GENERATIONS)
+jobs_module.configure(registry, GENERATION_TIMEOUT_SECONDS, _generate_semaphore)
 
 _metrics: dict[str, int | float] = {
     "requests_total": 0,
@@ -220,8 +229,6 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
         response.headers["X-Request-ID"] = request_id
         return response
 
-    loop = asyncio.get_running_loop()
-
     # 1. Count every attempt first
     with _metrics_lock:
         _metrics["generate_requests_total"] += 1
@@ -253,11 +260,9 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
         _metrics["generate_accepted_total"] += 1
         _metrics["generate_inflight"] += 1
 
-    effective, model_id = apply_quality_tier(payload)
-
-    #Resolve runtime engine for routed model_id (loads on first use per id).
+    _effective, model_id = apply_quality_tier(payload)
     try:
-        engine = registry.get_engine(model_id)
+        registry.get_engine(model_id)
     except ValueError as exc:
         _log_error("POST /generate rejected reason=unsupported_model_id", request_id)
         return JSONResponse(
@@ -271,12 +276,12 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
             headers={"X-Request-ID": request_id},
         )
 
-    # Offload the blocking CPU/GPU bound task
     start = time.perf_counter()
     try:
-        image_bytes, used_seed = await asyncio.wait_for(
-            loop.run_in_executor(None, engine.generate, effective),
-            timeout=GENERATION_TIMEOUT_SECONDS,
+        image_bytes, used_seed, effective, model_id = await generate_image_bytes(
+            payload,
+            registry=registry,
+            timeout_seconds=GENERATION_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
         with _metrics_lock:
@@ -317,19 +322,73 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
     return GenerateResponse(
         status="success",
         image_base64=image_base64,
-        metadata={
-            "prompt": effective.prompt,
-            "width": effective.width,
-            "height": effective.height,
-            "steps": effective.steps,
-            "guidance_scale": effective.guidance_scale,
-            "clip_skip": effective.clip_skip,
-            "scheduler": effective.scheduler,
-            "seed": used_seed,
-            "model_id": model_id,
-            "quality_tier": payload.quality_tier,
-        }
+        metadata=build_metadata(effective, payload, model_id, used_seed),
     )
+
+
+@app.post(
+    "/jobs",
+    response_model=JobCreateResponse,
+    status_code=202,
+    responses={401: {"model": ErrorResponse}, 429: {"model": ErrorResponse}},
+)
+async def create_job(
+    payload: JobCreateRequest,
+    http_request: Request,
+) -> JobCreateResponse | JSONResponse:
+    """Start async generate → evaluate → correct loop (in-process worker)."""
+    unauthorized = _require_api_key(http_request)
+    if unauthorized is not None:
+        return unauthorized
+
+    request_id = getattr(http_request.state, "request_id", "unknown")
+    provided_api_key = http_request.headers.get(API_KEY_HEADER, "")
+    if not _check_and_record_rate_limit(provided_api_key):
+        response = JSONResponse(
+            status_code=429,
+            content={
+                "status": "error",
+                "error_code": "rate_limited",
+                "message": "Rate limit exceeded",
+                "request_id": request_id,
+            },
+        )
+        response.headers["Retry-After"] = str(RATE_LIMIT_WINDOW_SECONDS)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    record = jobs_module.create_job(payload)
+    jobs_module.schedule_job(record.job_id, payload)
+    return JobCreateResponse(job_id=record.job_id, status="queued")
+
+
+@app.get(
+    "/jobs/{job_id}",
+    response_model=JobStatusResponse,
+    responses={401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+)
+async def get_job_status(
+    job_id: str,
+    http_request: Request,
+) -> JobStatusResponse | JSONResponse:
+    unauthorized = _require_api_key(http_request)
+    if unauthorized is not None:
+        return unauthorized
+
+    record = jobs_module.get_job(job_id)
+    if record is None:
+        request_id = getattr(http_request.state, "request_id", "unknown")
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "error_code": "job_not_found",
+                "message": f"Unknown job_id: {job_id}",
+                "request_id": request_id,
+            },
+        )
+    return record
+
 
 @app.get("/metrics", response_model=None)
 async def metrics(http_request: Request) -> dict[str, int | float] | JSONResponse:

@@ -16,12 +16,18 @@ type ErrBody = {
   details?: string | null;
 };
 
+type QualityTier = "fast" | "balanced" | "quality";
+
 export function GenerateForm() {
   const [prompt, setPrompt] = useState(
     "A photo of an astronaut riding a horse on Mars, cinematic lighting",
   );
+  const [qualityTier, setQualityTier] = useState<QualityTier>("fast");
   const [loading, setLoading] = useState(false);
   const [imageSrc, setImageSrc] = useState<string | null>(null);
+  const [metadata, setMetadata] = useState<Record<string, unknown> | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [requestId, setRequestId] = useState<string | null>(null);
 
@@ -31,12 +37,16 @@ export function GenerateForm() {
     setError(null);
     setRequestId(null);
     setImageSrc(null);
+    setMetadata(null);
 
     try {
       const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: prompt.trim() }),
+        body: JSON.stringify({
+          prompt: prompt.trim(),
+          quality_tier: qualityTier,
+        }),
       });
 
       const rid = res.headers.get("x-request-id");
@@ -55,6 +65,7 @@ export function GenerateForm() {
       const ok = data as OkBody;
       if (ok.image_base64) {
         setImageSrc(`data:image/jpeg;base64,${ok.image_base64}`);
+        if (ok.metadata) setMetadata(ok.metadata);
       } else {
         setError("Unexpected response shape from API");
       }
@@ -79,6 +90,19 @@ export function GenerateForm() {
             required
           />
         </label>
+        <label className="flex flex-col gap-2 text-sm font-medium text-zinc-700 dark:text-zinc-300">
+          Quality
+          <select
+            value={qualityTier}
+            onChange={(e) => setQualityTier(e.target.value as QualityTier)}
+            className="h-11 rounded-lg border border-zinc-300 bg-white px-3 text-base font-normal text-zinc-950 shadow-sm outline-none ring-zinc-400 focus:border-zinc-500 focus:ring-2 dark:border-zinc-600 dark:bg-zinc-950 dark:text-zinc-50"
+            disabled={loading}
+          >
+            <option value="fast">Fast (fewer steps)</option>
+            <option value="balanced">Balanced</option>
+            <option value="quality">Quality (more steps)</option>
+          </select>
+        </label>
         <button
           type="submit"
           disabled={loading || !prompt.trim()}
@@ -88,13 +112,31 @@ export function GenerateForm() {
         </button>
       </form>
 
-      {requestId && (
-        <p className="text-xs text-zinc-500 dark:text-zinc-400">
-          Request-ID:{" "}
-          <code className="rounded bg-zinc-100 px-1 py-0.5 font-mono text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200">
-            {requestId}
-          </code>
-        </p>
+      {(requestId || metadata) && (
+        <div className="flex flex-col gap-1 text-xs text-zinc-500 dark:text-zinc-400">
+          {requestId && (
+            <p>
+              Request-ID:{" "}
+              <code className="rounded bg-zinc-100 px-1 py-0.5 font-mono text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200">
+                {requestId}
+              </code>
+            </p>
+          )}
+          {metadata && (
+            <p>
+              {[
+                metadata.quality_tier != null &&
+                  `tier: ${String(metadata.quality_tier)}`,
+                metadata.steps != null && `steps: ${String(metadata.steps)}`,
+                metadata.guidance_scale != null &&
+                  `CFG: ${String(metadata.guidance_scale)}`,
+                metadata.seed != null && `seed: ${String(metadata.seed)}`,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            </p>
+          )}
+        </div>
       )}
 
       {error && (

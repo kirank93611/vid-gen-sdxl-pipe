@@ -150,9 +150,11 @@ This prevents unbounded pile-up of expensive inference requests.
 
 Generation is bounded by:
 
-- `GENERATION_TIMEOUT_SECONDS`
+- `GENERATION_TIMEOUT_SECONDS` (env, default `90`)
 
 This prevents a single slow request from holding API capacity forever.
+
+**Important:** `asyncio.wait_for` stops the HTTP wait; it does **not** cancel the GPU thread. See [Correction jobs](#correction-loop-first-mvp) and tech debt table.
 
 ### Thread safety
 
@@ -207,14 +209,84 @@ Completed since initial milestone list:
 - per-key rate limiting
 - `quality_tier` routing (`router.py`) with metadata (`model_id`, effective steps/CFG)
 - Next.js web app with Route Handler proxy (`apps/web`)
+- lazy-loaded `EngineRegistry` (`registry.py`)
+- integration test for `quality_tier` metadata
+- **Correction loop MVP** — `POST /jobs`, `GET /jobs/{job_id}` (see below)
 
 Next planned milestones:
 
-1. integration test for `quality_tier` end-to-end
-2. lazy-loaded engine manager (one active model in RAM)
-3. async job API (`POST /jobs`, `GET /jobs/{id}`) for multi-step flows
-4. orchestration layer (agent/planner above inference; tool calls into engines)
-5. production deploy on GPU cloud (e.g. Spheron) with CUDA backend abstraction
+1. **Benchmark evidence** — run `make benchmark-product` on real fixtures; record whether job loop beats baseline CLIP
+2. inpaint engine + mask step for `product_similarity_low` (not only tier bump)
+3. VLM rubric evaluator (composition, artifacts, phone visible, etc.)
+3. thin planner LLM over fixed tools (goal → capability graph, not CFG knobs)
+4. production deploy on GPU cloud (e.g. Spheron) with CUDA backend abstraction
+
+## Design layers (intent vs execution)
+
+External reviews (May 2026) and product direction align on **four layers**. The planner must **not** encode per-model samplers or CFG; adapters do.
+
+| Layer | Module(s) | Thinks in |
+|-------|-----------|-----------|
+| **Goal** | `schemas.VisualGoal`, job brief | `realism`, `preserve_product`, `task` |
+| **Capability** | `capabilities.py` | `text_to_image`, `inpainting` (future) |
+| **Policy** | `router.py`, `correction.py`, `quality_tier` | tier bumps, workflow retries |
+| **Adapter** | `sdxl_adapter.py`, `engine.py`, `registry.py` | steps, CFG, scheduler for `sdxl_base` |
+
+**Validation hypothesis (unproven):** closed-loop `generate → evaluate → correct` improves measurable quality on a **narrow** workflow. Until proven, avoid large planner/RAG systems.
+
+## Correction loop (first MVP)
+
+Stateful path for goal-seeking generation without holding a long HTTP connection on `/generate`.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as FastAPI
+    participant J as jobs.py
+    participant E as evaluator
+    participant P as correction
+    participant A as SDXL adapter + engine
+
+    C->>API: POST /jobs {goal, prompt, quality_tier}
+    API-->>C: 202 job_id queued
+    J->>A: generate (attempt 1)
+    A-->>J: image bytes + effective params
+    J->>E: evaluate_output(goal, effective)
+    E-->>J: passed / issues[]
+    alt not passed
+        J->>P: apply_corrections (e.g. bump tier)
+        P-->>J: patched GenerateRequest
+        J->>A: generate (attempt 2..N)
+    end
+    J-->>J: status converged | failed | error
+    C->>API: GET /jobs/{job_id}
+    API-->>C: iterations[], image_base64?
+```
+
+| Status | Meaning |
+|--------|---------|
+| `converged` | Evaluator passed within `max_iterations` |
+| `failed` | `error_code=convergence_failed` — no patch left or still failing |
+| `error` | `generation_timeout`, `capacity_reached`, `internal_error`, etc. |
+
+**Evaluator v0** — rule-based tier/steps vs `VisualGoal` (policy escalation).
+
+**Evaluator v1 (product vertical)** — when `reference_image_base64` is set and `preserve_product` or `product_similarity_min` is set, runs **CLIP image–image similarity** (`clip_evaluator.py`, default threshold `0.85`). Still not full VLM rubric; inpaint/mask corrections are next.
+
+**MVP corrector** bumps `quality_tier` on `product_similarity_low` and related issues (`fast` → `balanced` → `quality`). Future: localized inpaint, not only tier escalation.
+
+Stable error codes: `convergence_failed`, `job_not_found` (additive; do not rename without changelog).
+
+### Benchmark harness (experimental proof)
+
+Path: `benchmarks/product_similarity/` + `scripts/run_product_benchmark.py`.
+
+For each manifest case with a fixture JPEG:
+
+1. **Baseline** — one `POST /generate` → CLIP vs reference (computed in script).
+2. **Job** — `POST /jobs` with `reference_image_base64` → poll → final CLIP + iteration log.
+
+Outputs: `benchmarks/product_similarity/results/latest.json` and `latest.md` (gitignored). Use this to test the **unproven hypothesis**; do not treat positive `delta_clip` as product-market fit without human review.
 
 ## End-to-end architecture (current vs target)
 
@@ -342,9 +414,10 @@ sequenceDiagram
 | Area | What we have now | Debt if we rush multi-model / agents | Mitigation (do early) |
 |------|------------------|--------------------------------------|------------------------|
 | **Device** | Hard-coded `mps` in `engine.py` | Spheron uses **CUDA**; code paths diverge | `DEVICE` env (`mps` / `cuda` / `cpu`); single factory |
-| **Model loading** | **Eager** singleton at import/startup | OOM if multiple pipelines; slow cold switch | `EngineRegistry` with `load(model_id)` / `unload()`; max one resident on Mac |
+| **Model loading** | `EngineRegistry` lazy per `model_id` | OOM if multiple pipelines; no unload yet | `unload()`; max one resident on Mac |
 | **Routing** | `quality_tier` → steps/CFG only; always `sdxl_base` weights | “fast tier” without Lightning weights is misleading | Separate `model_id` from tier; honest 503 if weights missing |
-| **API shape** | Sync `POST /generate` only | Long agent chains hit **timeouts** (90s) | Add **jobs** contract; keep `/generate` for single step |
+| **API shape** | Sync `/generate` + in-process **jobs** (no external queue) | Jobs lost on restart; no ref images yet | Persist job store; artifact URLs; reference uploads |
+| **Correction** | Rules + CLIP vs ref on jobs | Tier bump alone won’t fix all CLIP failures; zombie GPU after timeout | Inpaint patch; hold semaphore until executor completes |
 | **Orchestration** | None (client → API) | Agent logic inside `main.py` | New module `orchestrator/` or external service; **tools** call inference API |
 | **Artifacts** | Base64 in JSON | Huge payloads; bad for multi-step | Job result: file URL / object storage key on cloud |
 | **Metrics** | Global counters | Cannot compare models/tiers | Label metrics by `model_id`, `quality_tier`, job status |
@@ -374,9 +447,12 @@ sequenceDiagram
 Prefer editing:
 
 - `services/inference-api/schemas.py` for API contract changes
-- `services/inference-api/router.py` for tier → steps/CFG (and future model selection)
+- `services/inference-api/router.py` for tier → steps/CFG (policy; moves toward adapter)
+- `services/inference-api/sdxl_adapter.py` for effective request + metadata
+- `services/inference-api/evaluator.py` / `correction.py` for closed-loop policy patches
+- `services/inference-api/jobs.py` for async correction jobs
 - `services/inference-api/main.py` for routing, policy, and metrics
-- `services/inference-api/engine.py` for inference/runtime behavior
+- `services/inference-api/engine.py` for inference/runtime behavior (SDXL adapter backend)
 - `apps/web/src/app/api/generate/route.ts` and UI components for client/proxy changes
 
 ### Before pushing

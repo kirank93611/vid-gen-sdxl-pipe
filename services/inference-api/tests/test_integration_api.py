@@ -56,7 +56,10 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
                 return _fake_generate_ok(self, req)
 
         main.registry.get_engine = lambda _model_id: _FakeEngine()
-        
+
+        import jobs as jobs_module
+
+        jobs_module.reset_store_for_tests()
         main.EXPECTED_API_KEY = self.API_HEADERS["X-API-Key"]
 
     async def asyncTearDown(self) -> None:
@@ -84,6 +87,19 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics["generate_rejected_total"], 0)
         self.assertEqual(metrics["generate_success_total"], 1)
         self.assertEqual(metrics["generate_inflight"], 0)
+
+    async def test_generate_quality_tier_balanced_sets_metadata(self) -> None:
+        resp = await self.client.post(
+            "/generate",
+            json={"prompt": "tier test", "quality_tier": "balanced"},
+            headers=self.API_HEADERS,
+        )
+        self.assertEqual(resp.status_code, 200)
+        meta = resp.json()["metadata"]
+        self.assertEqual(meta["steps"], 25)
+        self.assertEqual(meta["guidance_scale"], 6.0)
+        self.assertEqual(meta["model_id"], "sdxl_base")
+        self.assertEqual(meta["quality_tier"], "balanced")
 
     async def test_generate_backpressure_returns_429_and_retry_after(self) -> None:
         def _slow_generate(self: Any, req: Any) -> tuple[bytes, int]:
@@ -288,6 +304,82 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
             main.RATE_LIMIT_REQUESTS = old_limit
             main.RATE_LIMIT_WINDOW_SECONDS = old_window
             main._rate_limit_by_key = {}
+
+    async def test_job_correction_converges_after_tier_bump(self) -> None:
+        create = await self.client.post(
+            "/jobs",
+            json={
+                "goal": {"realism": "high"},
+                "prompt": "job test",
+                "quality_tier": "fast",
+                "max_iterations": 3,
+            },
+            headers=self.API_HEADERS,
+        )
+        self.assertEqual(create.status_code, 202)
+        job_id = create.json()["job_id"]
+
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            status = await self.client.get(f"/jobs/{job_id}", headers=self.API_HEADERS)
+            self.assertEqual(status.status_code, 200)
+            body = status.json()
+            if body["status"] in ("converged", "failed", "error"):
+                break
+        else:
+            self.fail("job did not finish in time")
+
+        self.assertEqual(body["status"], "converged")
+        self.assertGreaterEqual(len(body["iterations"]), 2)
+        self.assertEqual(body["iterations"][0]["passed"], False)
+        self.assertEqual(body["iterations"][-1]["passed"], True)
+        self.assertIsNotNone(body.get("image_base64"))
+
+    async def test_job_with_clip_reference_converges_when_similarity_improves(self) -> None:
+        import base64 as b64
+
+        ref_b64 = b64.b64encode(b"reference-jpeg").decode("utf-8")
+        call_count = {"n": 0}
+
+        def _clip_side_effect(_ref: bytes, _out: bytes) -> float:
+            call_count["n"] += 1
+            return 0.92 if call_count["n"] >= 2 else 0.5
+
+        with mock.patch("evaluator.clip_similarity", side_effect=_clip_side_effect):
+            create = await self.client.post(
+                "/jobs",
+                json={
+                    "goal": {"preserve_product": True, "product_similarity_min": 0.85},
+                    "prompt": "product on table",
+                    "quality_tier": "fast",
+                    "max_iterations": 3,
+                    "reference_image_base64": ref_b64,
+                },
+                headers=self.API_HEADERS,
+            )
+        self.assertEqual(create.status_code, 202)
+        job_id = create.json()["job_id"]
+
+        body: dict = {}
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            status = await self.client.get(f"/jobs/{job_id}", headers=self.API_HEADERS)
+            body = status.json()
+            if body["status"] in ("converged", "failed", "error"):
+                break
+
+        self.assertEqual(body["status"], "converged")
+        self.assertGreaterEqual(len(body["iterations"]), 2)
+        self.assertIn("product_similarity_low", body["iterations"][0]["issues"])
+        self.assertIsNotNone(body["iterations"][-1].get("clip_similarity"))
+
+    async def test_get_job_unknown_returns_404(self) -> None:
+        resp = await self.client.get(
+            "/jobs/00000000-0000-0000-0000-000000000000",
+            headers=self.API_HEADERS,
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json()["error_code"], "job_not_found")
 
 
 if __name__ == "__main__":
