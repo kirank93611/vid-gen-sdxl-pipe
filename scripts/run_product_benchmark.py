@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -35,10 +36,16 @@ def _read_manifest(path: Path) -> dict:
         return json.load(f)
 
 
-def _poll_job(client: httpx.Client, job_id: str, headers: dict, timeout_s: float) -> dict:
+def _poll_job(
+    client: httpx.Client,
+    job_id: str,
+    headers: dict,
+    timeout_s: float,
+    poll_read_timeout: httpx.Timeout,
+) -> dict:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        resp = client.get(f"/jobs/{job_id}", headers=headers)
+        resp = client.get(f"/jobs/{job_id}", headers=headers, timeout=poll_read_timeout)
         resp.raise_for_status()
         body = resp.json()
         if body["status"] in ("converged", "failed", "error"):
@@ -54,6 +61,9 @@ def _run_case(
     defaults: dict,
     reference_bytes: bytes,
     job_poll_timeout_s: float,
+    generate_timeout: httpx.Timeout,
+    poll_read_timeout: httpx.Timeout,
+    create_timeout: httpx.Timeout,
 ) -> dict:
     case_id = case["id"]
     prompt = case["prompt"]
@@ -66,7 +76,16 @@ def _run_case(
         "/generate",
         headers=headers,
         json={"prompt": prompt, "quality_tier": quality_tier},
+        timeout=generate_timeout,
     )
+    if baseline_resp.status_code == 504:
+        print(
+            "API returned 504 on POST /generate. The server stopped the run "
+            "(GENERATION_TIMEOUT_SECONDS). On M3 Pro, export a higher value before "
+            "`make run`, e.g. export GENERATION_TIMEOUT_SECONDS=600, and ensure "
+            "BENCHMARK_GENERATE_TIMEOUT_S is >= that + margin.",
+            file=sys.stderr,
+        )
     baseline_resp.raise_for_status()
     baseline_body = baseline_resp.json()
     baseline_image = base64.b64decode(baseline_body["image_base64"])
@@ -82,10 +101,13 @@ def _run_case(
             "max_iterations": max_iterations,
             "reference_image_base64": ref_b64,
         },
+        timeout=create_timeout,
     )
     job_resp.raise_for_status()
     job_id = job_resp.json()["job_id"]
-    job_body = _poll_job(client, job_id, headers, job_poll_timeout_s)
+    job_body = _poll_job(
+        client, job_id, headers, job_poll_timeout_s, poll_read_timeout
+    )
 
     final_clip = None
     if job_body.get("image_base64"):
@@ -159,8 +181,25 @@ def main() -> int:
         type=Path,
         default=_BENCHMARK_DIR / "results",
     )
-    parser.add_argument("--job-poll-timeout", type=float, default=600.0)
+    parser.add_argument(
+        "--generate-timeout",
+        type=float,
+        default=float(os.getenv("BENCHMARK_GENERATE_TIMEOUT_S", "420")),
+        help="HTTP read timeout for POST /generate (seconds). "
+        "Use >= GENERATION_TIMEOUT_SECONDS on the API plus margin.",
+    )
+    parser.add_argument(
+        "--job-poll-timeout",
+        type=float,
+        default=float(os.getenv("BENCHMARK_JOB_POLL_TIMEOUT_S", "600")),
+        help="Max wall time to poll GET /jobs until terminal status.",
+    )
     args = parser.parse_args()
+
+    generate_timeout = httpx.Timeout(args.generate_timeout)
+    poll_read_timeout = httpx.Timeout(30.0)
+    create_timeout = httpx.Timeout(30.0)
+    health_timeout = httpx.Timeout(30.0)
 
     manifest = _read_manifest(args.manifest)
     defaults = manifest.get("defaults", {})
@@ -170,8 +209,8 @@ def main() -> int:
     results: list[dict] = []
     skipped: list[str] = []
 
-    with httpx.Client(base_url=args.api_url, timeout=120.0) as client:
-        health = client.get("/health")
+    with httpx.Client(base_url=args.api_url) as client:
+        health = client.get("/health", timeout=health_timeout)
         if health.status_code != 200:
             print(f"API not healthy at {args.api_url}", file=sys.stderr)
             return 1
@@ -191,6 +230,9 @@ def main() -> int:
                     defaults,
                     reference_bytes,
                     args.job_poll_timeout,
+                    generate_timeout,
+                    poll_read_timeout,
+                    create_timeout,
                 )
             )
 

@@ -17,6 +17,7 @@ CAPABILITIES: dict[str, ModelCapability] = {
         "supports": (
             "text_to_image",
             "quality_tier_routing",
+            "inpainting",
         ),
     },
 }

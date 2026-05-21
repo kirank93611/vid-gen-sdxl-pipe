@@ -1,5 +1,9 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+
+import { StudioNav } from "@/components/studio/studio-nav";
+import { TooltipProvider } from "@/components/ui/tooltip";
+
 import "./globals.css";
 
 const geistSans = Geist({
@@ -13,8 +17,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SDXL — Web",
-  description: "Next.js UI for the local SDXL inference API",
+  title: "Visual Studio — Product composite",
+  description:
+    "SDXL product photography: generate, correction jobs, and GPU-backed inpaint",
 };
 
 export default function RootLayout({
@@ -25,9 +30,14 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      className={`${geistSans.variable} ${geistMono.variable} dark h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="studio-gradient flex min-h-full flex-col">
+        <TooltipProvider delayDuration={200}>
+          <StudioNav />
+          {children}
+        </TooltipProvider>
+      </body>
     </html>
   );
 }

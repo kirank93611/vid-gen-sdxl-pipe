@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from schemas import GenerateRequest
+from schemas import GenerateRequest, InpaintRequest
 from router import apply_quality_tier
 
 TIER_ORDER = ("fast", "balanced", "quality")
@@ -11,6 +11,19 @@ TIER_ORDER = ("fast", "balanced", "quality")
 def effective_request(req: GenerateRequest) -> tuple[GenerateRequest, str]:
     """Apply quality_tier policy then return (effective_request, model_id)."""
     return apply_quality_tier(req)
+
+
+def effective_inpaint_request(req: InpaintRequest) -> tuple[GenerateRequest, str]:
+    """Map InpaintRequest policy fields into a GenerateRequest for the adapter."""
+    gen = GenerateRequest(
+        prompt=req.prompt,
+        negative_prompt=req.negative_prompt,
+        quality_tier=req.quality_tier,
+        seed=req.seed,
+        width=req.width,
+        height=req.height,
+    )
+    return apply_quality_tier(gen)
 
 
 def bump_quality_tier(current: str | None) -> str | None:

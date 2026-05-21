@@ -45,6 +45,20 @@ def _load_clip() -> tuple[Any, Any, str]:
         return model, processor, device
 
 
+def _image_feature_tensor(model: Any, inputs: dict[str, Any]) -> Any:
+    """Normalize transformers 4.x (tensor) vs 5.x (ModelOutput) CLIP returns."""
+    import torch
+
+    out = model.get_image_features(**inputs)
+    if isinstance(out, torch.Tensor):
+        return out
+    if hasattr(out, "image_embeds") and out.image_embeds is not None:
+        return out.image_embeds
+    if hasattr(out, "pooler_output") and out.pooler_output is not None:
+        return out.pooler_output
+    raise TypeError(f"Unexpected CLIP get_image_features return type: {type(out)}")
+
+
 def clip_similarity(reference_jpeg: bytes, output_jpeg: bytes) -> float:
     """
     Cosine similarity between CLIP embeddings of two images (0–1 typical range).
@@ -62,7 +76,7 @@ def clip_similarity(reference_jpeg: bytes, output_jpeg: bytes) -> float:
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
     with torch.no_grad():
-        features = model.get_image_features(**inputs)
+        features = _image_feature_tensor(model, inputs)
         features = features / features.norm(dim=-1, keepdim=True)
         similarity = (features[0] @ features[1]).item()
 

@@ -24,9 +24,13 @@ def _fake_load_model(self: Any) -> None:
     self.pipeline = object()
 
 
-def _fake_generate_ok(self: Any, req: Any) -> tuple[bytes, int]:
+def _fake_generate_ok(self: Any, req: Any, **_: Any) -> tuple[bytes, int]:
     # Small deterministic payload to validate Base64 decode path.
     return b"fake-jpeg-bytes", 12345
+
+
+def _fake_inpaint_ok(self: Any, req: Any, **_kwargs: Any) -> tuple[bytes, int]:
+    return b"fake-inpaint-bytes", 54321
 
 
 with mock.patch.object(engine_module.SDXLEngine, "load_model", _fake_load_model), mock.patch.object(
@@ -52,14 +56,18 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         main._generate_semaphore = threading.Semaphore(main.MAX_INFLIGHT_GENERATIONS)
         
         class _FakeEngine:
-            def generate(self, req: Any) -> tuple[bytes, int]:
-                return _fake_generate_ok(self, req)
+            def generate(self, req: Any, **kwargs: Any) -> tuple[bytes, int]:
+                return _fake_generate_ok(self, req, **kwargs)
+
+            def inpaint(self, req: Any, init_image: Any, mask_image: Any, **kwargs: Any) -> tuple[bytes, int]:
+                return _fake_inpaint_ok(self, req, **kwargs)
 
         main.registry.get_engine = lambda _model_id: _FakeEngine()
 
         import jobs as jobs_module
 
         jobs_module.reset_store_for_tests()
+        main._rate_limit_by_key = {}
         main.EXPECTED_API_KEY = self.API_HEADERS["X-API-Key"]
 
     async def asyncTearDown(self) -> None:
@@ -70,7 +78,9 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["status"], "healthy")
-        self.assertEqual(body["engine"], "mps")
+        import device as device_module
+
+        self.assertEqual(body["engine"], device_module.get_runtime_device())
 
     async def test_generate_success_returns_base64_payload_and_metrics(self) -> None:
         resp = await self.client.post("/generate", json={"prompt": "test"}, headers=self.API_HEADERS)
@@ -106,7 +116,7 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
             time.sleep(0.25)
             return b"slow-bytes", 777
         class _Engine:
-            def generate(self, req: Any) -> tuple[bytes, int]:
+            def generate(self, req: Any, **kwargs: Any) -> tuple[bytes, int]:
                 return _slow_generate(self, req)
 
         main.registry.get_engine = lambda _model_id: _Engine()
@@ -133,7 +143,7 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("boom")
 
         class _Engine:
-            def generate(self, req: Any) -> tuple[bytes, int]:
+            def generate(self, req: Any, **kwargs: Any) -> tuple[bytes, int]:
                 return _raise_generate(self, req)  # or call _raise_generate / _very_slow_generate inside
 
         main.registry.get_engine = lambda _model_id: _Engine()
@@ -152,7 +162,7 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         old_env = main.APP_ENV
         main.APP_ENV = "dev"
         class _Engine:
-            def generate(self, req: Any) -> tuple[bytes, int]:
+            def generate(self, req: Any, **kwargs: Any) -> tuple[bytes, int]:
                 return _raise_generate(self, req)  # or call _raise_generate / _very_slow_generate inside
 
         main.registry.get_engine = lambda _model_id: _Engine()
@@ -176,7 +186,7 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         old_env = main.APP_ENV
         main.APP_ENV = "prod"
         class _Engine:
-            def generate(self, req: Any) -> tuple[bytes, int]:
+            def generate(self, req: Any, **kwargs: Any) -> tuple[bytes, int]:
                 return _raise_generate(self, req)  # or call _raise_generate / _very_slow_generate inside
 
         main.registry.get_engine = lambda _model_id: _Engine()
@@ -193,22 +203,30 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("request_id", body)
 
     async def test_generate_timeout_returns_504_and_updates_metrics(self) -> None:
-        def _very_slow_generate(self: Any, req: Any) -> tuple[bytes, int]:
-            time.sleep(1.5)
-            return b"late-bytes", 999
+        from engine import GenerationCancelledError
+
+        def _slow_until_cancel(self: Any, req: Any, cancel_event: Any = None) -> tuple[bytes, int]:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise GenerationCancelledError("cancelled")
+                time.sleep(0.02)
 
         old_timeout = main.GENERATION_TIMEOUT_SECONDS
         main.GENERATION_TIMEOUT_SECONDS = 0.1
+
         class _Engine:
-            def generate(self, req: Any) -> tuple[bytes, int]:
-                return _very_slow_generate(self, req)  # or call _raise_generate / _very_slow_generate inside
+            def generate(self, req: Any, cancel_event: Any = None) -> tuple[bytes, int]:
+                return _slow_until_cancel(self, req, cancel_event)
 
         main.registry.get_engine = lambda _model_id: _Engine()
         try:
+            started = time.perf_counter()
             resp = await self.client.post("/generate", json={"prompt": "timeout"}, headers=self.API_HEADERS)
+            elapsed = time.perf_counter() - started
         finally:
             main.GENERATION_TIMEOUT_SECONDS = old_timeout
 
+        self.assertLess(elapsed, 2.0, "should stop soon after cancel, not run full diffusion")
         self.assertEqual(resp.status_code, 504)
         body = resp.json()
         self.assertEqual(body["status"], "error")
@@ -372,6 +390,30 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(body["iterations"]), 2)
         self.assertIn("product_similarity_low", body["iterations"][0]["issues"])
         self.assertIsNotNone(body["iterations"][-1].get("clip_similarity"))
+
+    async def test_inpaint_success_returns_base64(self) -> None:
+        import base64 as b64
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 64), color=(40, 40, 40)).save(buf, format="JPEG")
+        tiny = b64.b64encode(buf.getvalue()).decode("utf-8")
+        resp = await self.client.post(
+            "/inpaint",
+            json={
+                "prompt": "refine product",
+                "image_base64": tiny,
+                "mask_base64": tiny,
+                "quality_tier": "fast",
+            },
+            headers=self.API_HEADERS,
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["status"], "success")
+        self.assertEqual(b64.b64decode(body["image_base64"]), b"fake-inpaint-bytes")
 
     async def test_get_job_unknown_returns_404(self) -> None:
         resp = await self.client.get(

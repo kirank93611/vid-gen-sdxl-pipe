@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import threading
 
+from device import resolve_torch_device
 from engine import SDXLEngine
 
 logger = logging.getLogger("sdxl_api")
@@ -27,8 +28,9 @@ class EngineRegistry:
     Thread-safe for concurrent get_engine calls; does not unload models yet.
     """
 
-    def __init__(self, default_model_path: str) -> None:
+    def __init__(self, default_model_path: str, device: str | None = None) -> None:
         self._default_model_path = default_model_path
+        self._device = device or resolve_torch_device()
         self._engines: dict[str, SDXLEngine] = {}
         self._lock = threading.Lock()
 
@@ -41,7 +43,8 @@ class EngineRegistry:
             if model_id not in self._engines:
                 logger.info("loading engine model_id=%s", model_id)
                 self._engines[model_id] = SDXLEngine(
-                    model_path = self._default_model_path,
+                    model_path=self._default_model_path,
+                    device=self._device,
                 )
             return self._engines[model_id]
 
