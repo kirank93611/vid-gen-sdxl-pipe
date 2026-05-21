@@ -18,6 +18,8 @@ Monorepo for **local SDXL image generation** on Apple Silicon (MPS) and a **Next
 
 ```text
 image-sd/
+├── benchmarks/product_similarity/   # CLIP benchmark manifest + fixtures
+├── scripts/run_product_benchmark.py
 ├── .cursor/rules/
 ├── apps/web/
 │   ├── src/app/              # pages + api/generate route
@@ -29,10 +31,19 @@ image-sd/
 │   ├── engine.py
 │   ├── main.py
 │   ├── router.py
+│   ├── registry.py
+│   ├── sdxl_adapter.py
+│   ├── evaluator.py
+│   ├── clip_evaluator.py
+│   ├── correction.py
+│   ├── jobs.py
 │   ├── schemas.py
 │   └── tests/
 │       ├── test_integration_api.py
-│       └── test_router.py
+│       ├── test_router.py
+│       ├── test_evaluator.py
+│       ├── test_correction.py
+│       └── test_clip_evaluator.py
 ├── ARCHITECTURE.md
 ├── LLD.md
 ├── Makefile
@@ -78,6 +89,10 @@ npm run dev
 Open `http://localhost:3000`, enter a prompt, and generate. The UI calls `/api/generate`, which forwards to the inference API with `X-API-Key` on the server.
 
 ## System flow (today)
+
+**Single shot:** browser → Next proxy → `POST /generate` → tier policy → SDXL → Base64 JSON.
+
+**Correction loop:** `POST /jobs` → worker runs generate → evaluate → bump tier if needed → `GET /jobs/{id}` when `converged` or `failed`. See [ARCHITECTURE.md](./ARCHITECTURE.md#correction-loop-first-mvp).
 
 ```mermaid
 flowchart LR
@@ -210,7 +225,19 @@ curl -sS -X POST "http://127.0.0.1:8001/generate" \
 
 Success responses include `image_base64` and `metadata` (`steps`, `guidance_scale`, `model_id`, `quality_tier`, `seed`, …). Responses include header `X-Request-ID`.
 
-`GENERATION_TIMEOUT_SECONDS` defaults to **90** in `main.py`; quality tiers can take most of that on a Mac — watch logs for `generation_timeout` (504).
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GENERATION_TIMEOUT_SECONDS` | `90` | Wall-clock cap per generate step (jobs run multiple steps) |
+| `SDXL_API_KEY` | `dev-local-key` | API key for `/generate`, `/metrics`, `/jobs` |
+| `SDXL_MODEL_PATH` | `<repo>/models/sdxl-base` | Weight directory |
+| `APP_ENV` | `dev` | `dev` includes error `details` on 500 |
+| `CLIP_MODEL_ID` | `openai/clip-vit-base-patch32` | Hugging Face model for job reference eval |
+| `CLIP_DEVICE` | `cpu` | Device for CLIP (keep `cpu` on Mac if MPS busy with SDXL) |
+| `PRODUCT_SIMILARITY_MIN` | `0.85` | Default CLIP threshold when `goal.product_similarity_min` unset |
+
+On Mac, use `export GENERATION_TIMEOUT_SECONDS=300` before `make run` when using `balanced` / `quality` tiers or multi-step jobs.
+
+Watch logs for `generation_timeout` (504). Note: timeout ends the HTTP wait; GPU work may still finish in the background (see ARCHITECTURE.md).
 
 ## Request fields
 
@@ -227,6 +254,50 @@ Success responses include `image_base64` and `metadata` (`steps`, `guidance_scal
 | `scheduler` | `dpm++2m_karras` or `euler` |
 
 Unknown fields (e.g. `lora_path`) return **422**.
+
+## Correction jobs (`POST /jobs`)
+
+Goal-seeking generation with bounded retries (policy correction, not LLM planner).
+
+```bash
+# Create job (202) — tier-only correction
+curl -sS -X POST "http://127.0.0.1:8001/jobs" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-local-key" \
+  -d '{
+    "goal": { "realism": "high" },
+    "prompt": "photorealistic portrait, soft natural light",
+    "quality_tier": "fast",
+    "max_iterations": 3
+  }'
+
+# Product reference (CLIP similarity) — set preserve_product or product_similarity_min
+# reference_image_base64: base64-encoded JPEG of your product SKU photo
+curl -sS -X POST "http://127.0.0.1:8001/jobs" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-local-key" \
+  -d '{
+    "goal": { "preserve_product": true, "product_similarity_min": 0.85 },
+    "prompt": "luxury ring on velvet, studio lighting",
+    "quality_tier": "fast",
+    "max_iterations": 3,
+    "reference_image_base64": "<BASE64_JPEG>"
+  }'
+
+# Poll (replace JOB_ID)
+curl -sS "http://127.0.0.1:8001/jobs/JOB_ID" -H "X-API-Key: dev-local-key"
+```
+
+| Job `status` | Meaning |
+|--------------|---------|
+| `queued` / `running` | In progress |
+| `converged` | Evaluator passed; `image_base64` set |
+| `failed` | `error_code`: `convergence_failed` |
+| `error` | e.g. `generation_timeout`, `capacity_reached` |
+
+Response includes `iterations[]` (attempt, `issues`, `clip_similarity` when ref provided, tier/steps per try).
+
+**Evaluator note:** v1 CLIP measures reference match, not full scene correctness. Tier bump is a coarse correction; inpaint pipeline is planned for localized fixes.
 
 ## Backpressure and rate limits
 
@@ -249,6 +320,17 @@ make test-integration
 
 Runs `test_integration_api.py` and `test_router.py` with **mocked** GPU work.
 
+## Product benchmark (hypothesis test)
+
+Prove whether the **job loop** beats **single-shot** `/generate` on CLIP vs a product reference (not human QA).
+
+1. Add SKU JPEGs under `benchmarks/product_similarity/fixtures/` (see `manifest.json`).
+2. `make run` with `GENERATION_TIMEOUT_SECONDS=300`.
+3. `make benchmark-product`
+4. Read `benchmarks/product_similarity/results/latest.md`.
+
+Coach guide: [benchmarks/product_similarity/README.md](./benchmarks/product_similarity/README.md).
+
 ## Web app (`apps/web`)
 
 From repo root, in a second terminal:
@@ -267,7 +349,8 @@ npm run dev
 ## Collaboration notes
 
 - Contract source of truth: `schemas.py` + integration tests.
-- Inference only in `engine.py` (and future engine modules).
+- Inference only in `engine.py` (and future engine modules per `model_id`).
+- Goal/intent types (`VisualGoal`) stay separate from adapter knobs (`steps`, `scheduler`).
 - Contract changes → update tests, this README, and `ARCHITECTURE.md` when behavior meaning changes.
 
 ## Common issues

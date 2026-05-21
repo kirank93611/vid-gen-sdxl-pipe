@@ -147,6 +147,8 @@ classDiagram
 | `GET` | `/health` | No | `200` engine status JSON |
 | `GET` | `/metrics` | `X-API-Key` | `200` counters |
 | `POST` | `/generate` | `X-API-Key` | `200` / `401` / `422` / `429` / `500` / `504` |
+| `POST` | `/jobs` | `X-API-Key` | `202` / `401` / `429` |
+| `GET` | `/jobs/{job_id}` | `X-API-Key` | `200` / `401` / `404` |
 | — | `/docs` | No | OpenAPI UI |
 
 ### 4.1 Stable `error_code` values (product surface)
@@ -155,7 +157,9 @@ classDiagram
 |------|----------------|------|
 | 401 | `unauthorized` | Missing/wrong API key |
 | 422 | (validation) | Pydantic / unknown fields |
-| 422 | `unsupported_model_id` | Planned: registry rejects `model_id` |
+| 422 | `unsupported_model_id` | Registry rejects `model_id` |
+| 404 | `job_not_found` | Unknown `job_id` on `GET /jobs/{id}` |
+| (job body) | `convergence_failed` | Job `status=failed` after max iterations |
 | 429 | `rate_limited` | Per-key sliding window exceeded |
 | 429 | `capacity_reached` | Semaphore `MAX_INFLIGHT_GENERATIONS` |
 | 500 | `internal_error` | Unhandled exception |
@@ -344,26 +348,54 @@ flowchart LR
         D5[Next proxy + form]
     end
 
-    subgraph InProgress["In repo, not fully wired"]
-        IP1[EngineRegistry lazy load]
+    subgraph Done2["Also implemented"]
+        D6[EngineRegistry lazy load]
+        D7[POST /jobs + GET /jobs/id]
+        D8[evaluator + correction loop]
     end
 
     subgraph Planned["LLD target"]
-        P1[registry wired in main]
-        P2[POST /jobs + worker]
-        P3[inpaint engine + pipeline]
+        P1[inpaint engine + mask pipeline]
+        P2[VLM rubric evaluator]
+        P3[planner over tools]
         P4[DEVICE=cuda Spheron]
     end
 
-    Done --> InProgress
-    InProgress --> Planned
+    Done --> Done2
+    Done2 --> Planned
 ```
 
 ---
 
-## 12. Planned — async jobs (reference sequence)
+## 12. Correction jobs (implemented MVP)
 
-Not implemented yet; preserved for pipeline/brand work.
+In-process worker (`jobs.py`); state is **lost on process restart**.
+
+### HTTP
+
+| Method | Path | Success | Notes |
+|--------|------|---------|-------|
+| POST | `/jobs` | 202 | Body: `JobCreateRequest` (`goal`, `prompt`, `quality_tier`, `max_iterations`) |
+| GET | `/jobs/{job_id}` | 200 | `JobStatusResponse`; 404 `job_not_found` |
+
+### Schemas (additive)
+
+- `VisualGoal` — model-agnostic intent (`realism`, `preserve_product`, `task`)
+- `JobCreateRequest`, `JobCreateResponse`, `JobStatusResponse`, `JobIterationRecord`, `EvalResult`
+
+### Modules
+
+| Module | Role |
+|--------|------|
+| `evaluator.py` | Rules + optional CLIP when `reference_image_base64` set |
+| `clip_evaluator.py` | Lazy CLIP (`CLIP_MODEL_ID`, `CLIP_DEVICE`, `PRODUCT_SIMILARITY_MIN`) |
+| `correction.py` | Maps `issues[]` → policy patch (tier bump); no raw CFG |
+| `sdxl_adapter.py` | `effective_request`, `build_metadata`, `bump_quality_tier` |
+| `generation_service.py` | Shared `generate_image_bytes` for `/generate` and jobs |
+| `capabilities.py` | Manifest: which `model_id` supports which capability |
+| `jobs.py` | Store, schedule, `generate → evaluate → correct` loop |
+
+### Sequence
 
 ```mermaid
 sequenceDiagram
@@ -400,20 +432,43 @@ Integration tests patch `SDXLEngine.load_model` / `generate` at import time. Whe
 
 ```text
 services/inference-api/
-├── main.py           # HTTP, policy, executor, metrics
-├── schemas.py        # Pydantic contracts
-├── router.py         # quality_tier → steps/CFG/model_id
-├── registry.py       # Engine lifecycle (lazy cache)
-├── engine.py         # diffusers SDXL on MPS
-├── client.py         # Sample HTTP client
+├── main.py               # HTTP, /generate, /jobs, metrics
+├── schemas.py            # Pydantic contracts (+ job/goal types)
+├── router.py             # quality_tier → steps/CFG/model_id
+├── registry.py           # Engine lifecycle (lazy cache)
+├── sdxl_adapter.py       # Policy → effective GenerateRequest
+├── generation_service.py # Shared async generate
+├── evaluator.py          # Goal vs output (rules + CLIP)
+├── clip_evaluator.py     # CLIP similarity (lazy load)
+├── correction.py         # issues → policy patch
+├── capabilities.py       # model_id capability manifest
+├── jobs.py               # Correction job store + worker
+├── engine.py             # diffusers SDXL on MPS
+├── client.py             # Sample HTTP client
 └── tests/
     ├── test_integration_api.py
-    └── test_router.py
+    ├── test_router.py
+    ├── test_evaluator.py
+    ├── test_correction.py
+    └── test_clip_evaluator.py
 ```
 
 ---
 
-## 15. Related documents
+## 15. Benchmark harness
+
+| Path | Role |
+|------|------|
+| `benchmarks/product_similarity/manifest.json` | Case list: `id`, `prompt`, `reference_path`, optional overrides |
+| `benchmarks/product_similarity/fixtures/` | Reference JPEGs (not in git until you add them) |
+| `scripts/run_product_benchmark.py` | HTTP client: baseline vs job, writes `results/latest.json` |
+| `make benchmark-product` | Runs script (requires live API + fixtures) |
+
+Integration test: `tests/test_benchmark_manifest.py` (schema only, no GPU).
+
+---
+
+## 16. Related documents
 
 | Document | Contents |
 |----------|----------|
