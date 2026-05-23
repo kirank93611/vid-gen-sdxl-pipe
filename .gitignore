@@ -34,7 +34,7 @@ htmlcov/
 dmypy.json
 
 # --- ML weights & caches (never commit) ---
-models/
+/models/
 **/.cache/
 *.safetensors
 *.ckpt

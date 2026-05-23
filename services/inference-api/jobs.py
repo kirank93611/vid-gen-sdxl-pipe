@@ -10,7 +10,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Literal
 
 from correction import resolve_correction
-from evaluator import _decode_reference, evaluate_output
+from evaluator import decode_reference, evaluate_output
 from generation_service import generate_image_bytes, inpaint_image_bytes
 from image_utils import (
     decode_image_bytes,
@@ -122,7 +122,7 @@ async def _run_job(job_id: str, payload: JobCreateRequest) -> None:
     inpaint_next = False
 
     try:
-        reference_bytes = _decode_reference(payload.reference_image_base64)
+        reference_bytes = decode_reference(payload.reference_image_base64)
     except ValueError as exc:
         _set_error(job_id, "invalid_request", str(exc))
         return

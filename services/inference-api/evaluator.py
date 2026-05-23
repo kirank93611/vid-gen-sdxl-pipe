@@ -14,7 +14,8 @@ logger = logging.getLogger("sdxl_api")
 _HIGH_REALISM_MIN_STEPS = 20
 
 
-def _decode_reference(reference_image_base64: str | None) -> bytes | None:
+def decode_reference(reference_image_base64: str | None) -> bytes | None:
+    """Decode optional base64 reference image for CLIP evaluation."""
     if not reference_image_base64:
         return None
     try:

@@ -1,3 +1,9 @@
+"""
+SDXL diffusers pipelines: text-to-image and inpaint on the resolved torch device.
+
+Loaded lazily via EngineRegistry; supports cooperative cancel between diffusion steps.
+"""
+
 import torch
 import threading
 import io
@@ -61,6 +67,12 @@ class SDXLEngine:
             self.pipeline.scheduler.config
         )
         print(f"Model initialized on {self.device}.")
+
+    def unload(self) -> None:
+        """Release GPU weights (registry calls this when switching to GGUF chat)."""
+        with self._lock:
+            self.pipeline = None
+            self.inpaint_pipeline = None
 
     def generate(
         self,

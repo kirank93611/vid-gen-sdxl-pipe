@@ -1,51 +1,80 @@
 """
-Lazy-loaded inference engines keyed by model_id.
-Architecture intent:
-- Owns engine lifecycle (create, cache, future unload) — not HTTP or routing policy.
-- main.py calls get_engine(model_id) after router.apply_quality_tier.
-- MVP: only sdxl_base; one cached instance per id on this process.
+Lazy-loaded engines keyed by model_id (catalog in model_catalog.py).
+
+Only one heavy model resident in VRAM at a time (unload on switch).
 """
-
-
 
 from __future__ import annotations
 
 import logging
 import threading
+from typing import Union
 
 from device import resolve_torch_device
 from engine import SDXLEngine
+from gguf_engine import GGUFEngine
+from model_catalog import (
+    CHAT_MODEL_IDS,
+    IMAGE_MODEL_IDS,
+    SUPPORTED_MODEL_IDS,
+    get_chat_model,
+    get_image_model,
+)
 
 logger = logging.getLogger("sdxl_api")
 
-# Stable ids echoed in API metadata; add new ids when weights + engine class exist.
-SUPPORTED_MODEL_IDS = frozenset({"sdxl_base"})
+EngineT = Union[SDXLEngine, GGUFEngine]
+
 
 class EngineRegistry:
-    """
-    Process-local cache of SDXLEngine instances.
-
-    Thread-safe for concurrent get_engine calls; does not unload models yet.
-    """
-
     def __init__(self, default_model_path: str, device: str | None = None) -> None:
         self._default_model_path = default_model_path
         self._device = device or resolve_torch_device()
-        self._engines: dict[str, SDXLEngine] = {}
+        self._engines: dict[str, EngineT] = {}
         self._lock = threading.Lock()
 
-    def get_engine(self,model_id:str) -> SDXLEngine:
-        if model_id not in SUPPORTED_MODEL_IDS:
-            raise ValueError(f"Unsupported model_id: {model_id}")
+    def _unload(self, model_id: str) -> None:
+        eng = self._engines.pop(model_id, None)
+        if eng is None:
+            return
+        if hasattr(eng, "unload"):
+            eng.unload()
+        logger.info("unloaded model_id=%s", model_id)
 
-        # Double-checked under lock: first request pays load_model(); rest reuse instance.
+    def _evict_all_except(self, keep_id: str) -> None:
+        for mid in list(self._engines.keys()):
+            if mid != keep_id:
+                self._unload(mid)
+
+    def get_engine(self, model_id: str) -> SDXLEngine:
+        if model_id not in IMAGE_MODEL_IDS:
+            raise ValueError(f"Not an image model_id: {model_id}")
+        get_image_model(model_id)
         with self._lock:
+            self._evict_all_except(model_id)
             if model_id not in self._engines:
-                logger.info("loading engine model_id=%s", model_id)
+                logger.info("loading image engine model_id=%s", model_id)
+                spec = get_image_model(model_id)
+                path = str(spec.local_path) if spec.local_path.is_dir() else self._default_model_path
                 self._engines[model_id] = SDXLEngine(
-                    model_path=self._default_model_path,
+                    model_path=path,
                     device=self._device,
                 )
-            return self._engines[model_id]
+            eng = self._engines[model_id]
+        if not isinstance(eng, SDXLEngine):
+            raise TypeError("engine type mismatch")
+        return eng
 
-
+    def get_chat_engine(self, model_id: str) -> GGUFEngine:
+        if model_id not in CHAT_MODEL_IDS:
+            raise ValueError(f"Not a chat model_id: {model_id}")
+        spec = get_chat_model(model_id)
+        with self._lock:
+            self._evict_all_except(model_id)
+            if model_id not in self._engines:
+                logger.info("loading chat engine model_id=%s", model_id)
+                self._engines[model_id] = GGUFEngine(spec=spec)
+            eng = self._engines[model_id]
+        if not isinstance(eng, GGUFEngine):
+            raise TypeError("engine type mismatch")
+        return eng

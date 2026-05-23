@@ -1,3 +1,9 @@
+"""
+Minimal CLI client for POST /generate (local smoke tests).
+
+Prefer scripts/spheron_generate.py for VM deploy checks; see services/inference-api/README.md.
+"""
+
 import base64
 import os
 from pathlib import Path

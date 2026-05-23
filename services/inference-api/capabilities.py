@@ -1,8 +1,10 @@
-"""Capability manifest: model-agnostic skills vs concrete model_id (adapter registry)."""
+"""Capability manifest — derived from model_catalog."""
 
 from __future__ import annotations
 
 from typing import TypedDict
+
+from model_catalog import list_capabilities as _list_capabilities
 
 
 class ModelCapability(TypedDict):
@@ -10,25 +12,12 @@ class ModelCapability(TypedDict):
     supports: tuple[str, ...]
 
 
-# Planner/policy use capability names; adapters map model_id → execution knobs.
-CAPABILITIES: dict[str, ModelCapability] = {
-    "sdxl_base": {
-        "model_id": "sdxl_base",
-        "supports": (
-            "text_to_image",
-            "quality_tier_routing",
-            "inpainting",
-        ),
-    },
-}
-
-
 def list_capabilities() -> list[ModelCapability]:
-    return list(CAPABILITIES.values())
+    return _list_capabilities()  # type: ignore[return-value]
 
 
 def model_supports(model_id: str, capability: str) -> bool:
-    entry = CAPABILITIES.get(model_id)
-    if entry is None:
-        return False
-    return capability in entry["supports"]
+    for entry in list_capabilities():
+        if entry["model_id"] == model_id:
+            return capability in entry["supports"]
+    return False
