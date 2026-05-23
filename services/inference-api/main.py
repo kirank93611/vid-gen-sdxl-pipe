@@ -21,6 +21,7 @@ from api_auth import require_api_key
 from api_config import (
     API_KEY_HEADER,
     APP_ENV,
+    CHAT_TIMEOUT_SECONDS,
     EXPECTED_API_KEY,
     GENERATION_TIMEOUT_SECONDS,
     INPAINT_STRENGTH,
@@ -29,8 +30,9 @@ from api_config import (
     RATE_LIMIT_WINDOW_SECONDS,
     SDXL_MODEL_PATH,
 )
+from chat_service import chat_completion, load_chat_model
 from api_logging import configure_logging, log_error, log_info
-from capabilities import list_capabilities
+from model_catalog import get_chat_model, list_capabilities, list_models_payload
 from device import get_runtime_device
 from generation_service import generate_image_bytes, inpaint_image_bytes
 import jobs as jobs_module
@@ -38,6 +40,8 @@ from rate_limit import check_and_record_rate_limit
 from registry import EngineRegistry
 from router import apply_quality_tier
 from schemas import (
+    ChatRequest,
+    ChatResponse,
     ErrorResponse,
     GenerateRequest,
     GenerateResponse,
@@ -473,6 +477,216 @@ async def metrics(http_request: Request) -> dict[str, int | float] | JSONRespons
             "generate_accepted_total": generate_accepted_total,
             "generate_timeout_total": int(_metrics["generate_timeout_total"]),
         }
+
+@app.post(
+    "/chat",
+    response_model=ChatResponse,
+    responses={
+        401: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+        504: {"model": ErrorResponse},
+    },
+)
+async def chat(
+    payload: ChatRequest,
+    http_request: Request,
+) -> ChatResponse | JSONResponse:
+    """
+    Text completion via catalog GGUF models (llama.cpp).
+
+    Not for images — use POST /generate. See GET /models for model_id values.
+    """
+    unauthorized = require_api_key(http_request)
+    if unauthorized is not None:
+        return unauthorized
+
+    request_id = getattr(http_request.state, "request_id", "unknown")
+    provided_api_key = http_request.headers.get(API_KEY_HEADER, "")
+    if not check_and_record_rate_limit(provided_api_key):
+        return _rate_limited_response(request_id)
+
+    try:
+        spec = get_chat_model(payload.model_id)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "error",
+                "error_code": "unsupported_model_id",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+
+    if not spec.is_on_disk():
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "error_code": "model_not_available",
+                "message": (
+                    f"GGUF not on disk for {payload.model_id}. On GPU VM run: "
+                    f"python scripts/download_gguf_model.py {payload.model_id}"
+                ),
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+
+    acquired = _generate_semaphore.acquire(blocking=False)
+    if not acquired:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "status": "error",
+                "error_code": "capacity_reached",
+                "message": "GPU busy, retry later",
+                "request_id": request_id,
+            },
+            headers={"Retry-After": "5", "X-Request-ID": request_id},
+        )
+
+    try:
+        text, meta = await chat_completion(
+            payload,
+            registry=registry,
+            timeout_seconds=CHAT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=504,
+            content={
+                "status": "error",
+                "error_code": "chat_timeout",
+                "message": "Chat completion timed out",
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+    except FileNotFoundError:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "error_code": "model_not_available",
+                "message": f"GGUF missing for {payload.model_id}",
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+    except RuntimeError as exc:
+        log_error(logger, f"POST /chat failed: {exc}", request_id)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "error_code": "model_load_failed",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+    finally:
+        _generate_semaphore.release()
+
+    return ChatResponse(status="success", text=text, metadata=meta)
+
+
+@app.post("/models/{model_id}/load")
+async def load_chat_model_endpoint(
+    model_id: str,
+    http_request: Request,
+) -> JSONResponse:
+    """Load a chat GGUF into VRAM (unloads SDXL). Call when user picks a model in the UI."""
+    unauthorized = require_api_key(http_request)
+    if unauthorized is not None:
+        return unauthorized
+
+    request_id = getattr(http_request.state, "request_id", "unknown")
+    provided_api_key = http_request.headers.get(API_KEY_HEADER, "")
+    if not check_and_record_rate_limit(provided_api_key):
+        return _rate_limited_response(request_id)
+
+    try:
+        spec = get_chat_model(model_id)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "error",
+                "error_code": "unsupported_model_id",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+
+    if not spec.is_on_disk():
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "error_code": "model_not_available",
+                "message": (
+                    f"GGUF not on disk for {model_id}. On GPU VM run: "
+                    f"python scripts/download_gguf_model.py {model_id}"
+                ),
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+
+    acquired = _generate_semaphore.acquire(blocking=True)
+    try:
+        meta = await load_chat_model(
+            model_id,
+            registry=registry,
+            timeout_seconds=CHAT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=504,
+            content={
+                "status": "error",
+                "error_code": "model_load_timeout",
+                "message": "Model load timed out",
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+    except RuntimeError as exc:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "error_code": "model_load_failed",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+    finally:
+        _generate_semaphore.release()
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "success",
+            "model_id": meta["model_id"],
+            "message": "Model loaded into VRAM",
+            "request_id": request_id,
+        },
+        headers={"X-Request-ID": request_id},
+    )
+
+
+@app.get("/models")
+async def list_models() -> dict[str, list]:
+    """Dynamic model catalog (image + chat), including on_disk status."""
+    return {"models": list_models_payload()}
+
 
 @app.get("/capabilities")
 async def capabilities() -> dict[str, list]:

@@ -102,51 +102,59 @@ Open **http://localhost:3001** — lime header, bottom **Generate** dock, **Prod
 
 Run **`make spheron-*` on your Mac only** — not inside the VM SSH session.
 
-### First time on a fresh VM
+**Spot VMs get a new IP every deploy.** Set it once per instance:
 
 ```bash
-# Mac
-cd image-sd
-make spheron-sync
-ssh -i ~/.ssh/id_ed25519 ubuntu@<VM_IP>
+cp .env.spheron.example .env.spheron
+make spheron-set-ip IP=216.81.248.248          # writes .env.spheron (gitignored)
+# optional: SPM_USER=ubuntu make spheron-set-ip IP=...
 ```
 
-On the VM:
+| Command | When | Time |
+|---------|------|------|
+| `make spheron-set-ip IP=…` | New IP from Spheron dashboard | instant |
+| `make spheron-sync` | Code only | ~seconds |
+| `make spheron-setup` | **First** VM (torch + SDXL download) | ~15–25 min |
+| `make spheron-up` | **Same disk**, new IP (skip model/torch if present) | ~5–15 min |
+| `make spheron-deploy` | Code + restart API + rebuild web | ~5–15 min |
+| `make spheron-tunnel` | Browser → studio + API | — |
+
+### First time on a fresh VM (empty disk)
 
 ```bash
-cd ~/image-sd
-bash scripts/spheron_setup.sh          # CUDA, venv, download models
-bash scripts/spheron_restart_api.sh   # API on :8001
-bash scripts/spheron_deploy_web.sh    # production web on :3000
+make spheron-set-ip IP=<VM_IP>
+make spheron-setup    # sync + spheron_setup.sh on VM
+make spheron-tunnel   # http://127.0.0.1:3000
 ```
 
-Or one-shot bootstrap (setup + API + smoke image):
+### Every new spot instance (IP changed, models still on disk)
 
 ```bash
-bash scripts/spheron_vm_bootstrap.sh
+make spheron-set-ip IP=<NEW_IP>
+make spheron-up       # sync + quick bootstrap (API + web)
+make spheron-tunnel
 ```
 
-### Every code update (Mac → VM)
+If the disk was wiped, use `make spheron-setup` again instead of `spheron-up`.
+
+### Code-only update (same VM, same IP)
 
 ```bash
-# Mac — sync code + restart API + rebuild web
 make spheron-deploy
 ```
 
-Or on the VM after you synced from Mac:
+On the VM after sync from Mac:
 
 ```bash
-cd ~/image-sd
+cd /root/image-sd   # or ~/image-sd for ubuntu user
 make deploy-api
 make deploy-web
 ```
 
 ### Use the UI from your Mac
 
-**Terminal 1** — tunnel (do not use `http://0.0.0.0:3000` in the browser):
-
 ```bash
-ssh -L 3000:127.0.0.1:3000 -i ~/.ssh/id_ed25519 ubuntu@<VM_IP>
+make spheron-tunnel
 ```
 
 **Browser:** http://127.0.0.1:3000 — hard refresh `Cmd+Shift+R`

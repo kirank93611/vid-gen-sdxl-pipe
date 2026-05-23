@@ -64,6 +64,14 @@ else
   echo "Model already present at $MODEL_DIR ($(du -sh "$MODEL_DIR" | cut -f1))"
 fi
 
+if [[ "${DOWNLOAD_LLM:-0}" == "1" ]] || [[ "${DOWNLOAD_TIEFIGHTER:-0}" == "1" ]]; then
+  GGUF_ID="${GGUF_MODEL_ID:-dolphin_mixtral_8x7b}"
+  echo "==> GGUF chat model: $GGUF_ID (POST /chat)"
+  bash scripts/ensure_llama_cpp_cuda.sh
+  GGUF_MODEL_ID="$GGUF_ID" python scripts/download_gguf_model.py
+fi
+
 echo "==> Done. Start API with:"
 echo "  export DEVICE=cuda SDXL_MODEL_PATH=$MODEL_DIR GENERATION_TIMEOUT_SECONDS=300"
 echo "  make run"
+echo "Optional chat: DOWNLOAD_LLM=1 GGUF_MODEL_ID=dolphin_mixtral_8x7b bash scripts/spheron_setup.sh"

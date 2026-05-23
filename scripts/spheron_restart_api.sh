@@ -31,6 +31,8 @@ stop_port_8001() {
 stop_port_8001
 
 source "$REPO_ROOT/.venv/bin/activate"
+# shellcheck disable=SC1091
+source "$REPO_ROOT/scripts/llama_cuda_env.sh"
 export DEVICE="${DEVICE:-cuda}"
 export GENERATION_TIMEOUT_SECONDS="${GENERATION_TIMEOUT_SECONDS:-300}"
 export GENERATION_CANCEL_GRACE_SECONDS="${GENERATION_CANCEL_GRACE_SECONDS:-120}"

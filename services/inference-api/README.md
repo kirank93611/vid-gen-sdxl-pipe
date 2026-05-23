@@ -45,6 +45,7 @@ See [docs/CODEBASE.md](../../docs/CODEBASE.md) for the full dependency graph.
 | POST | `/jobs` | Key | 202 + `job_id`; poll `GET /jobs/{id}` |
 | GET | `/jobs/{job_id}` | Key | Status, iterations, final image |
 | GET | `/health` | — | `engine` = mps/cuda/cpu |
+| POST | `/chat` | Key | TieFighter 20B GGUF text (not images) |
 | GET | `/capabilities` | — | Model skill manifest |
 | GET | `/metrics` | Key | Counters for ops dashboards |
 | GET | `/openapi.json` | — | Machine-readable contract |
@@ -66,6 +67,24 @@ Defined in `api_config.py`:
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Sliding window length |
 | `APP_ENV` | `dev` | `dev` adds error `details` on 500 |
 | `DEVICE` | auto | `cuda`, `mps`, or `cpu` (see `device.py`) |
+| `TIEFIGHTER_GGUF_FILE` | `...-Q4_K_M.gguf` | Quant file name under `models/tiefighter-20b/` |
+| `TIEFIGHTER_N_GPU_LAYERS` | `-1` | llama.cpp GPU layers (`-1` = all) |
+| `CHAT_TIMEOUT_SECONDS` | `120` | `/chat` wall-clock timeout |
+
+### TieFighter 20B (text GGUF)
+
+This is a **text LLM**, not an image model. Use **`POST /chat`** for prompt expansion, copy, agents — not **`POST /generate`**.
+
+Download on GPU VM (~12 GB for Q4_K_M):
+
+```bash
+make spheron-download-llm
+# or: DOWNLOAD_TIEFIGHTER=1 bash scripts/spheron_setup.sh
+```
+
+HF repo may require accepting the model gate on huggingface.co first.
+
+Only **one** of SDXL or TieFighter stays loaded in VRAM at a time (automatic unload on switch).
 
 ## Jobs and reference images
 

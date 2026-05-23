@@ -28,6 +28,7 @@ npm run build && npm run start   # production on :3000
 | Path | Type | Purpose |
 |------|------|---------|
 | `/` | Client | Studio editor (`StudioEditor` + bottom dock) |
+| `/chat` | Client | GGUF chat — model picker + conversation |
 | `/explore` | Server | Marketing / hero |
 | `/studio` | Redirect | → `/` |
 | `/api/generate` | Route Handler | Proxy to `POST /generate` |

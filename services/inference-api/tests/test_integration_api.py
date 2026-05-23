@@ -438,6 +438,78 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(resp.json()["error_code"], "job_not_found")
 
+    async def test_chat_success_when_gguf_present(self) -> None:
+        class _FakeChatEngine:
+            def complete(self, req: Any) -> tuple[str, dict[str, str]]:
+                return "Hello from dolphin", {"model_id": "dolphin_mixtral_8x7b"}
+
+        main.registry.get_chat_engine = lambda _mid: _FakeChatEngine()
+
+        fake_spec = mock.Mock()
+        fake_spec.is_on_disk.return_value = True
+        with mock.patch("main.get_chat_model", return_value=fake_spec):
+            resp = await self.client.post(
+                "/chat",
+                json={
+                    "model_id": "dolphin_mixtral_8x7b",
+                    "prompt": "Say hello in one word",
+                    "max_tokens": 32,
+                },
+                headers=self.API_HEADERS,
+            )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["status"], "success")
+        self.assertEqual(body["text"], "Hello from dolphin")
+
+    async def test_chat_returns_503_when_gguf_missing(self) -> None:
+        fake_spec = mock.Mock()
+        fake_spec.is_on_disk.return_value = False
+        with mock.patch("main.get_chat_model", return_value=fake_spec):
+            resp = await self.client.post(
+                "/chat",
+                json={"model_id": "dolphin_mixtral_8x7b", "prompt": "test"},
+                headers=self.API_HEADERS,
+            )
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.json()["error_code"], "model_not_available")
+
+    async def test_models_lists_catalog(self) -> None:
+        resp = await self.client.get("/models")
+        self.assertEqual(resp.status_code, 200)
+        ids = {m["model_id"] for m in resp.json()["models"]}
+        self.assertIn("sdxl_base", ids)
+        self.assertIn("dolphin_mixtral_8x7b", ids)
+        self.assertIn("tiefighter_20b", ids)
+
+    async def test_load_chat_model_success(self) -> None:
+        class _FakeChatEngine:
+            def load(self) -> None:
+                return None
+
+        main.registry.get_chat_engine = lambda _mid: _FakeChatEngine()
+
+        fake_spec = mock.Mock()
+        fake_spec.is_on_disk.return_value = True
+        with mock.patch("main.get_chat_model", return_value=fake_spec):
+            resp = await self.client.post(
+                "/models/dolphin_mixtral_8x7b/load",
+                headers=self.API_HEADERS,
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "success")
+
+    async def test_load_chat_model_503_when_missing(self) -> None:
+        fake_spec = mock.Mock()
+        fake_spec.is_on_disk.return_value = False
+        with mock.patch("main.get_chat_model", return_value=fake_spec):
+            resp = await self.client.post(
+                "/models/dolphin_mixtral_8x7b/load",
+                headers=self.API_HEADERS,
+            )
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.json()["error_code"], "model_not_available")
+
 
 if __name__ == "__main__":
     unittest.main()

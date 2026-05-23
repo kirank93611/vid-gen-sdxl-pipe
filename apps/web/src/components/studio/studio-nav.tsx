@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils";
 const NAV = [
   { href: "/explore", label: "Explore" },
   { href: "/", label: "Image" },
+  { href: "/chat", label: "Chat" },
 ] as const;
 
 export function StudioNav() {
@@ -32,7 +33,9 @@ export function StudioNav() {
               const active =
                 item.href === "/"
                   ? pathname === "/" || pathname === "/studio"
-                  : pathname.startsWith(item.href);
+                  : item.href === "/chat"
+                    ? pathname === "/chat"
+                    : pathname.startsWith(item.href);
               return (
                 <Link
                   key={item.href}

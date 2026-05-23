@@ -5,7 +5,7 @@ Changing fields here is a contract change: update integration tests and apps/web
 OpenAPI is generated from FastAPI routes that use these models.
 """
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Annotated, Literal
 from typing import Any
 
@@ -199,3 +199,36 @@ class JobStatusResponse(BaseModel):
     metadata: dict[str, Any] | None = None
     error_code: str | None = None
     message: str | None = None
+
+
+class ChatRequest(BaseModel):
+    """POST /chat — GGUF text LLM (not image generation)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_id: str = Field(
+        default="dolphin_mixtral_8x7b",
+        description="Chat model_id from GET /models (catalog). Unloads SDXL from VRAM when loaded.",
+    )
+
+    @field_validator("model_id")
+    @classmethod
+    def validate_chat_model_id(cls, v: str) -> str:
+        from model_catalog import get_chat_model
+
+        get_chat_model(v)
+        return v
+    prompt: str = Field(..., min_length=1)
+    system_prompt: str | None = Field(
+        default=None,
+        description="Optional system instruction (prompt expansion, style, etc.).",
+    )
+    max_tokens: Annotated[int, Field(default=512, ge=1, le=4096)]
+    temperature: Annotated[float, Field(default=0.7, ge=0.0, le=2.0)]
+    top_p: Annotated[float, Field(default=0.9, ge=0.0, le=1.0)]
+
+
+class ChatResponse(BaseModel):
+    status: str
+    text: str
+    metadata: dict[str, Any]

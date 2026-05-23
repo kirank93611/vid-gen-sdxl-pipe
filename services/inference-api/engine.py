@@ -68,6 +68,12 @@ class SDXLEngine:
         )
         print(f"Model initialized on {self.device}.")
 
+    def unload(self) -> None:
+        """Release GPU weights (registry calls this when switching to GGUF chat)."""
+        with self._lock:
+            self.pipeline = None
+            self.inpaint_pipeline = None
+
     def generate(
         self,
         req: GenerateRequest,

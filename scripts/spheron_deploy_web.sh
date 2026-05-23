@@ -6,6 +6,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WEB_DIR="$REPO_ROOT/apps/web"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/scripts/spheron_ensure_node.sh"
 cd "$WEB_DIR"
 
 stop_port_3000() {
@@ -37,6 +39,7 @@ echo "==> Removing stale .next..."
 rm -rf .next
 
 cat > .env.local <<EOF
+SDXL_INFERENCE_BASE=http://127.0.0.1:8001
 SDXL_API_URL=http://127.0.0.1:8001/generate
 SDXL_JOBS_URL=http://127.0.0.1:8001/jobs
 SDXL_API_KEY=${SDXL_API_KEY:-dev-local-key}
@@ -58,7 +61,8 @@ stop_port_3000
 
 echo "==> Starting next start..."
 : > /tmp/visual-studio-web.log
-nohup npm run start -- -H 0.0.0.0 -p 3000 >> /tmp/visual-studio-web.log 2>&1 &
+nohup bash -lc 'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"; . "$NVM_DIR/nvm.sh"; cd "'"$WEB_DIR"'" && exec npm run start -- -H 0.0.0.0 -p 3000' \
+  >> /tmp/visual-studio-web.log 2>&1 &
 disown || true
 
 for i in 1 2 3 4 5 6 7 8 9 10; do

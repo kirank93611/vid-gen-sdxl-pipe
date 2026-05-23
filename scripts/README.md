@@ -13,16 +13,36 @@ Shell helpers for Spheron GPU VM deploy and benchmarks. Run from **repository ro
 | `spheron_generate.py` | Either | CLI smoke test against `/generate` |
 | `clean.sh` | Mac or VM | Remove `.next`, caches, generated artifacts |
 
+## Dynamic VM IP (spot instances)
+
+```bash
+make spheron-set-ip IP=216.81.248.248   # writes .env.spheron (gitignored)
+make spheron-sync                       # uses SPHERON_HOST from .env.spheron
+make spheron-tunnel                     # SSH -L 3000 and 8001
+```
+
+See `.env.spheron.example` at repo root.
+
 ## Makefile targets (preferred)
 
 ```bash
-make spheron-sync      # Mac → rsync repo to VM (not on VM)
-make spheron-deploy    # Mac: sync + remote deploy-api + deploy-web
-make deploy-api        # VM: restart inference API
-make deploy-web        # VM: build and restart Next.js
-make clean             # Wrapper for clean.sh
-make spheron-benchmark # Product similarity benchmark (GPU)
+make spheron-set-ip IP=…  # save IP after each Spheron deploy
+make spheron-sync         # Mac → rsync code only
+make spheron-setup        # first VM: full torch + SDXL download
+make spheron-up           # recycled VM with models on disk: fast API + web
+make spheron-deploy       # sync + restart API + rebuild web
+make spheron-tunnel       # browser tunnel to studio
+make deploy-api           # VM: restart inference API
+make deploy-web           # VM: build and restart Next.js
+make clean                # wrapper for clean.sh
+make spheron-benchmark    # product similarity benchmark (GPU)
 ```
+
+| Script | Run on | Purpose |
+|--------|--------|---------|
+| `spheron_bootstrap_quick.sh` | VM | Fast spin-up if `.venv` + `models/` exist |
+| `spheron_set_ip.sh` | Mac | Update `.env.spheron` + clear stale `known_hosts` |
+| `spheron_tunnel.sh` | Mac | Tunnel 3000 / 8001 |
 
 ## Typical flow
 
