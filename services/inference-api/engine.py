@@ -1,3 +1,9 @@
+"""
+SDXL diffusers pipelines: text-to-image and inpaint on the resolved torch device.
+
+Loaded lazily via EngineRegistry; supports cooperative cancel between diffusion steps.
+"""
+
 import torch
 import threading
 import io

@@ -1,15 +1,42 @@
+"""
+FastAPI entrypoint: HTTP routes, middleware, metrics, and GPU backpressure.
+
+Business logic lives in generation_service, jobs, router, and engine.
+See services/inference-api/README.md and docs/CODEBASE.md.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import base64
-import os
 import traceback
+import threading
 import time
 import uuid
-import threading
-import logging
-from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from api_auth import require_api_key
+from api_config import (
+    API_KEY_HEADER,
+    APP_ENV,
+    EXPECTED_API_KEY,
+    GENERATION_TIMEOUT_SECONDS,
+    INPAINT_STRENGTH,
+    MAX_INFLIGHT_GENERATIONS,
+    RATE_LIMIT_REQUESTS,
+    RATE_LIMIT_WINDOW_SECONDS,
+    SDXL_MODEL_PATH,
+)
+from api_logging import configure_logging, log_error, log_info
+from capabilities import list_capabilities
+from device import get_runtime_device
+from generation_service import generate_image_bytes, inpaint_image_bytes
+import jobs as jobs_module
+from rate_limit import check_and_record_rate_limit
+from registry import EngineRegistry
+from router import apply_quality_tier
 from schemas import (
     ErrorResponse,
     GenerateRequest,
@@ -19,66 +46,17 @@ from schemas import (
     JobCreateResponse,
     JobStatusResponse,
 )
-from registry import EngineRegistry
-from router import apply_quality_tier
-import jobs as jobs_module
-from generation_service import generate_image_bytes, inpaint_image_bytes
-from device import get_runtime_device
 from sdxl_adapter import build_metadata, effective_inpaint_request
 
-# Repo root: .../image-sd (models live at <repo>/models/sdxl-base)
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_MODEL = _REPO_ROOT / "models" / "sdxl-base"
-RATE_LIMIT_REQUESTS = 5
-RATE_LIMIT_WINDOW_SECONDS = 60
-
-
-# --- Modern API Initialization ---
 app = FastAPI(
     title="SDXL Image Generation API",
-    description="Stateless SDXL-Lightning REST API optimized for M3 Pro."
+    description="Stateless SDXL REST API (generate, inpaint, async jobs).",
 )
 
-# Lazy engine cache; first /generate loads weights (see registry.get_engine).
-registry = EngineRegistry(
-    default_model_path=os.environ.get("SDXL_MODEL_PATH", str(_DEFAULT_MODEL)),
-)
-logger = logging.getLogger("sdxl_api")
-
-
-class RequestIdFilter(logging.Filter):
-    """
-    Logging filter that guarantees `request_id` exists on every log record.
-
-    Why this exists:
-    - Our logging formatter expects `%(request_id)s`.
-    - Third-party logs (or logs outside middleware context) may not set it.
-    - Without this filter, formatting can raise KeyError.
-    """
-    def filter(self, record: logging.LogRecord) -> bool:
-        # If request_id was not injected by middleware, add a safe fallback.
-        if not hasattr(record, "request_id"):
-            record.request_id = "-"
-        # Returning True tells logging to emit the record.
-        return True
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s request_id=%(request_id)s %(message)s",
-)
-for handler in logging.getLogger().handlers:
-    handler.addFilter(RequestIdFilter())
-
-APP_ENV = os.getenv("APP_ENV", "dev").lower()
-API_KEY_HEADER = "X-API-Key"
-EXPECTED_API_KEY = os.getenv("SDXL_API_KEY", "dev-local-key")
+registry = EngineRegistry(default_model_path=SDXL_MODEL_PATH)
+logger = configure_logging()
 
 _metrics_lock = threading.Lock()
-
-MAX_INFLIGHT_GENERATIONS = 1
-GENERATION_TIMEOUT_SECONDS = int(os.getenv("GENERATION_TIMEOUT_SECONDS", "90"))
-INPAINT_STRENGTH = float(os.getenv("INPAINT_STRENGTH", "0.85"))
 _generate_semaphore = threading.Semaphore(MAX_INFLIGHT_GENERATIONS)
 jobs_module.configure(
     registry,
@@ -103,35 +81,20 @@ _metrics: dict[str, int | float] = {
 }
 
 
-def _log_info(message: str, request_id: str) -> None:
-    logger.info(message, extra={"request_id": request_id})
-
-
-def _log_error(message: str, request_id: str) -> None:
-    logger.error(message, extra={"request_id": request_id})
-
-
-def _auth_error_response(request_id: str) -> JSONResponse:
+def _rate_limited_response(request_id: str) -> JSONResponse:
+    log_error(logger, "request rejected reason=rate_limited", request_id)
     response = JSONResponse(
-        status_code=401,
+        status_code=429,
         content={
             "status": "error",
-            "error_code": "unauthorized",
-            "message": "Invalid or missing API key",
+            "error_code": "rate_limited",
+            "message": "Rate limit exceeded",
             "request_id": request_id,
         },
     )
+    response.headers["Retry-After"] = str(RATE_LIMIT_WINDOW_SECONDS)
     response.headers["X-Request-ID"] = request_id
     return response
-
-
-def _require_api_key(http_request: Request) -> JSONResponse | None:
-    request_id = getattr(http_request.state, "request_id", "unknown")
-    provided_api_key = http_request.headers.get(API_KEY_HEADER)
-    if provided_api_key != EXPECTED_API_KEY:
-        _log_error("request rejected reason=invalid_api_key", request_id)
-        return _auth_error_response(request_id)
-    return None
 
 
 @app.middleware("http")
@@ -144,7 +107,7 @@ async def request_context_middleware(request: Request, call_next):
         _metrics["requests_total"] += 1
         _metrics["requests_inflight"] += 1
 
-    _log_info(f"{request.method} {request.url.path} started", request_id)
+    log_info(logger, f"{request.method} {request.url.path} started", request_id)
     try:
         response = await call_next(request)
     except Exception:
@@ -162,7 +125,8 @@ async def request_context_middleware(request: Request, call_next):
             _metrics["requests_success_total"] += 1
 
     response.headers["X-Request-ID"] = request_id
-    _log_info(
+    log_info(
+        logger,
         f"{request.method} {request.url.path} completed status={response.status_code} duration_ms={duration_ms:.2f}",
         request_id,
     )
@@ -173,7 +137,7 @@ async def request_context_middleware(request: Request, call_next):
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Unified error response for production safety."""
     request_id = getattr(request.state, "request_id", "unknown")
-    _log_error(f"{type(exc).__name__}: {exc}", request_id)
+    log_error(logger, f"{type(exc).__name__}: {exc}", request_id)
 
     content: dict[str, str] = {
         "status": "error",
@@ -201,7 +165,7 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
     Primary inference endpoint.
     Uses asyncio.run_in_executor to offload PyTorch to background threads.
     """
-    unauthorized = _require_api_key(http_request)
+    unauthorized = require_api_key(http_request)
     if unauthorized is not None:
         return unauthorized
 
@@ -222,20 +186,8 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
     request_id = getattr(http_request.state, "request_id", "unknown")
     provided_api_key = http_request.headers.get(API_KEY_HEADER, "")
 
-    if not _check_and_record_rate_limit(provided_api_key):
-        _log_error("POST /generate rejected reason=rate_limited", request_id)
-        response = JSONResponse(
-            status_code=429,
-            content={
-                "status":"error",
-                "error_code":"rate_limited",
-                "message":"Rate limit exceeded",
-                "request_id":request_id,
-            },
-        )
-        response.headers["Retry-After"] = str(RATE_LIMIT_WINDOW_SECONDS)
-        response.headers["X-Request-ID"] = request_id
-        return response
+    if not check_and_record_rate_limit(provided_api_key):
+        return _rate_limited_response(request_id)
 
     # 1. Count every attempt first
     with _metrics_lock:
@@ -248,7 +200,7 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
         with _metrics_lock:
             _metrics["generate_rejected_total"] += 1
         request_id = getattr(http_request.state, "request_id", "unknown")
-        _log_error("POST /generate rejected reason=capacity_reached", request_id)
+        log_error(logger, "POST /generate rejected reason=capacity_reached", request_id)
 
         response = JSONResponse(
             status_code=429,
@@ -272,7 +224,7 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
     try:
         registry.get_engine(model_id)
     except ValueError as exc:
-        _log_error("POST /generate rejected reason=unsupported_model_id", request_id)
+        log_error(logger, "POST /generate rejected reason=unsupported_model_id", request_id)
         return JSONResponse(
             status_code=422,
             content={
@@ -295,7 +247,7 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
         with _metrics_lock:
             _metrics["generate_timeout_total"] += 1
         request_id = getattr(http_request.state, "request_id", "unknown")
-        _log_error("POST /generate timed out", request_id)
+        log_error(logger, "POST /generate timed out", request_id)
         response = JSONResponse(
             status_code=504,
             content={
@@ -344,25 +296,14 @@ async def inpaint(
     http_request: Request,
 ) -> GenerateResponse | JSONResponse:
     """Repaint masked region of an existing image (SDXL inpaint pipeline)."""
-    unauthorized = _require_api_key(http_request)
+    unauthorized = require_api_key(http_request)
     if unauthorized is not None:
         return unauthorized
 
     request_id = getattr(http_request.state, "request_id", "unknown")
     provided_api_key = http_request.headers.get(API_KEY_HEADER, "")
-    if not _check_and_record_rate_limit(provided_api_key):
-        response = JSONResponse(
-            status_code=429,
-            content={
-                "status": "error",
-                "error_code": "rate_limited",
-                "message": "Rate limit exceeded",
-                "request_id": request_id,
-            },
-        )
-        response.headers["Retry-After"] = str(RATE_LIMIT_WINDOW_SECONDS)
-        response.headers["X-Request-ID"] = request_id
-        return response
+    if not check_and_record_rate_limit(provided_api_key):
+        return _rate_limited_response(request_id)
 
     acquired = _generate_semaphore.acquire(blocking=False)
     if not acquired:
@@ -460,25 +401,14 @@ async def create_job(
     http_request: Request,
 ) -> JobCreateResponse | JSONResponse:
     """Start async generate → evaluate → correct loop (in-process worker)."""
-    unauthorized = _require_api_key(http_request)
+    unauthorized = require_api_key(http_request)
     if unauthorized is not None:
         return unauthorized
 
     request_id = getattr(http_request.state, "request_id", "unknown")
     provided_api_key = http_request.headers.get(API_KEY_HEADER, "")
-    if not _check_and_record_rate_limit(provided_api_key):
-        response = JSONResponse(
-            status_code=429,
-            content={
-                "status": "error",
-                "error_code": "rate_limited",
-                "message": "Rate limit exceeded",
-                "request_id": request_id,
-            },
-        )
-        response.headers["Retry-After"] = str(RATE_LIMIT_WINDOW_SECONDS)
-        response.headers["X-Request-ID"] = request_id
-        return response
+    if not check_and_record_rate_limit(provided_api_key):
+        return _rate_limited_response(request_id)
 
     record = jobs_module.create_job(payload)
     jobs_module.schedule_job(record.job_id, payload)
@@ -494,7 +424,7 @@ async def get_job_status(
     job_id: str,
     http_request: Request,
 ) -> JobStatusResponse | JSONResponse:
-    unauthorized = _require_api_key(http_request)
+    unauthorized = require_api_key(http_request)
     if unauthorized is not None:
         return unauthorized
 
@@ -515,7 +445,7 @@ async def get_job_status(
 
 @app.get("/metrics", response_model=None)
 async def metrics(http_request: Request) -> dict[str, int | float] | JSONResponse:
-    unauthorized = _require_api_key(http_request)
+    unauthorized = require_api_key(http_request)
     if unauthorized is not None:
         return unauthorized
 
@@ -544,6 +474,12 @@ async def metrics(http_request: Request) -> dict[str, int | float] | JSONRespons
             "generate_timeout_total": int(_metrics["generate_timeout_total"]),
         }
 
+@app.get("/capabilities")
+async def capabilities() -> dict[str, list]:
+    """Model capability manifest for planners and clients (no auth)."""
+    return {"models": list_capabilities()}
+
+
 @app.get("/health")
 async def health_check() -> dict[str, str]:
     """Engine and hardware status check."""
@@ -553,129 +489,3 @@ async def health_check() -> dict[str, str]:
         "backend": "diffusers",
         "optimization": "lightning",
     }
-
-from collections import deque
-from dataclasses import dataclass
-import time
-
-@dataclass
-class KeyRateState:
-    """
-    Per-API-key rate limit state.
-
-    Attributes:
-        request_timestamps:
-            A deque storing timestamps of recent requests.
-            The deque is maintained in chronological order.
-
-    Invariant:
-        All timestamps in this deque are within the active
-        rate limit window after cleanup.
-    """
-    # Ordered timestamps (oldest on the left, newest on the right).
-    # We pop from the left when entries age out of the time window.
-    request_timestamps: deque[float]
-
-# Global synchronization primitive protecting shared rate limit state.
-# Ensures correctness under concurrent request handling.
-_rate_limit_lock = threading.Lock()
-
-# In-memory storage mapping API keys to their rate limit state.
-#
-# Example:
-#
-# {
-#     "key1": KeyRateState([...timestamps...]),
-#     "key2": KeyRateState([...timestamps...])
-# }
-#
-# Lifetime:
-# - Exists for the duration of the process
-# - Cleared on service restart
-_rate_limit_by_key: dict[str, KeyRateState] = {}
-
-def _check_and_record_rate_limit(api_key: str) -> bool:
-    """
-    Check whether a request is allowed under the configured rate limit
-    and record the request timestamp if allowed.
-
-    This function performs three operations atomically:
-    1) Removes timestamps outside the sliding window
-    2) Evaluates current request count
-    3) Records the new request if permitted
-
-    Args:
-        api_key:
-            The API key associated with the incoming request.
-
-    Returns:
-        bool:
-            True  -> request is allowed
-            False -> rate limit exceeded
-
-    Thread Safety:
-        Protected by a global lock to prevent race conditions
-        when multiple requests for the same key arrive concurrently.
-
-    Time Complexity:
-        O(k) where k is number of requests in the current window.
-        Typically small due to bounded request rate.
-
-    Failure Mode:
-        If the limit is exceeded, the caller should return:
-            HTTP 429
-            error_code="rate_limited"
-    """
-
-    # Use monotonic clock to avoid issues if system time changes.
-    # This guarantees timestamps always move forward.
-    now =time.monotonic()
-
-    # Critical section:
-    # Protect shared dictionary and per-key state.
-    with _rate_limit_lock:
-
-        # Initialize state for new API key.
-        if api_key not in _rate_limit_by_key:
-            _rate_limit_by_key[api_key] = KeyRateState(request_timestamps=deque())
-
-        state = _rate_limit_by_key[api_key]
-
-        # Determine start of the active rate limit window.
-        window_start = now - RATE_LIMIT_WINDOW_SECONDS
-
-        # ------------------------------------------------------------------
-        # Cleanup Phase
-        # ------------------------------------------------------------------
-        # Remove timestamps that fall outside the current window.
-        # Because deque is ordered, we only check from the left.
-        #
-        # Example:
-        # window = last 60 seconds
-        #
-        # Before:
-        # [t-120, t-90, t-10]
-        #
-        # After cleanup:
-        # [t-10]
-        # ------------------------------------------------------------------
-        while state.request_timestamps and state.request_timestamps[0] < window_start:
-            state.request_timestamps.popleft()
-            
-        # ------------------------------------------------------------------
-        # Limit Check
-        # ------------------------------------------------------------------
-        # If the number of remaining timestamps equals or exceeds
-        # the configured request limit, reject the request.
-        # ------------------------------------------------------------------
-        if len(state.request_timestamps) >= RATE_LIMIT_REQUESTS:
-            return False
-        
-        # ------------------------------------------------------------------
-        # Record Request
-        # ------------------------------------------------------------------
-        # Append current timestamp to track this request.
-        # ------------------------------------------------------------------
-        state.request_timestamps.append(now)
-
-        return True

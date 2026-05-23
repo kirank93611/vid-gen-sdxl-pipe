@@ -1,3 +1,10 @@
+"""
+Pydantic request/response models — the HTTP JSON contract (source of truth).
+
+Changing fields here is a contract change: update integration tests and apps/web proxies.
+OpenAPI is generated from FastAPI routes that use these models.
+"""
+
 from pydantic import BaseModel, ConfigDict, Field
 from typing import Annotated, Literal
 from typing import Any

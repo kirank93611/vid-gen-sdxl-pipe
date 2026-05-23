@@ -67,7 +67,12 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         import jobs as jobs_module
 
         jobs_module.reset_store_for_tests()
-        main._rate_limit_by_key = {}
+        import rate_limit as rate_limit_module
+
+        rate_limit_module.reset_for_tests()
+        import api_config
+
+        api_config.EXPECTED_API_KEY = self.API_HEADERS["X-API-Key"]
         main.EXPECTED_API_KEY = self.API_HEADERS["X-API-Key"]
 
     async def asyncTearDown(self) -> None:
@@ -267,15 +272,20 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("request_id", body)
 
     async def test_generate_rate_limited_returns_429(self) -> None:
-        old_limit = main.RATE_LIMIT_REQUESTS
-        old_window = main.RATE_LIMIT_WINDOW_SECONDS
-        try:
-            main.RATE_LIMIT_REQUESTS = 1
-            main.RATE_LIMIT_WINDOW_SECONDS = 60
-            main._rate_limit_by_key= {}
+        import api_config
+        import rate_limit as rate_limit_module
 
-            first = await self.client.post("/generate", json={"prompt":"first"},headers=self.API_HEADERS,)
-            second = await self.client.post("/generate", json={"prompt":"second"},headers = self.API_HEADERS,)
+        old_limit = api_config.RATE_LIMIT_REQUESTS
+        try:
+            api_config.RATE_LIMIT_REQUESTS = 1
+            rate_limit_module.reset_for_tests()
+
+            first = await self.client.post(
+                "/generate", json={"prompt": "first"}, headers=self.API_HEADERS
+            )
+            second = await self.client.post(
+                "/generate", json={"prompt": "second"}, headers=self.API_HEADERS
+            )
 
             self.assertEqual(first.status_code, 200)
             self.assertEqual(second.status_code, 429)
@@ -283,45 +293,50 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
             body = second.json()
             self.assertEqual(body["status"], "error")
             self.assertEqual(body["error_code"], "rate_limited")
-            self.assertIn("request_id",body)
+            self.assertIn("request_id", body)
             self.assertIsNotNone(second.headers.get("Retry-After"))
             self.assertIsNotNone(second.headers.get("X-Request-ID"))
 
         finally:
-            main.RATE_LIMIT_REQUESTS = old_limit
-            main.RATE_LIMIT_WINDOW_SECONDS = old_window
-            main._rate_limit_by_key = {}
+            api_config.RATE_LIMIT_REQUESTS = old_limit
+            rate_limit_module.reset_for_tests()
 
     async def test_generate_rate_limit_is_per_key(self) -> None:
-        old_limit = main.RATE_LIMIT_REQUESTS
-        old_window = main.RATE_LIMIT_WINDOW_SECONDS
+        import api_config
+        import rate_limit as rate_limit_module
+
+        old_limit = api_config.RATE_LIMIT_REQUESTS
         try:
-            main.RATE_LIMIT_REQUESTS = 1
-            main.RATE_LIMIT_WINDOW_SECONDS = 60
-            main._rate_limit_by_key= {}
+            api_config.RATE_LIMIT_REQUESTS = 1
+            rate_limit_module.reset_for_tests()
 
             key_a_headers = {"X-API-Key": "key-a"}
             key_b_headers = {"X-API-Key": "key-b"}
+            api_config.EXPECTED_API_KEY = "key-a"
             main.EXPECTED_API_KEY = "key-a"
 
-            #key-a first request allowed
-            r1=await self.client.post("/generate", json={"prompt":"a1"}, headers=key_a_headers)
+            r1 = await self.client.post(
+                "/generate", json={"prompt": "a1"}, headers=key_a_headers
+            )
             self.assertEqual(r1.status_code, 200)
 
-            # key-a second request should be rate-limited
-            r2=await self.client.post("/generate", json={"prompt":"a2"},headers=key_a_headers)
+            r2 = await self.client.post(
+                "/generate", json={"prompt": "a2"}, headers=key_a_headers
+            )
             self.assertEqual(r2.status_code, 429)
             self.assertEqual(r2.json()["error_code"], "rate_limited")
 
-            #Switch expected key to key-b
+            api_config.EXPECTED_API_KEY = "key-b"
             main.EXPECTED_API_KEY = "key-b"
-            r3 = await self.client.post("/generate", json={"prompt":"b1"},headers=key_b_headers)
+            r3 = await self.client.post(
+                "/generate", json={"prompt": "b1"}, headers=key_b_headers
+            )
             self.assertEqual(r3.status_code, 200)
         finally:
+            api_config.EXPECTED_API_KEY = self.API_HEADERS["X-API-Key"]
             main.EXPECTED_API_KEY = self.API_HEADERS["X-API-Key"]
-            main.RATE_LIMIT_REQUESTS = old_limit
-            main.RATE_LIMIT_WINDOW_SECONDS = old_window
-            main._rate_limit_by_key = {}
+            api_config.RATE_LIMIT_REQUESTS = old_limit
+            rate_limit_module.reset_for_tests()
 
     async def test_job_correction_converges_after_tier_bump(self) -> None:
         create = await self.client.post(

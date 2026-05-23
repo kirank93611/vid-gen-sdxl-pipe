@@ -5,8 +5,13 @@ Monorepo: **FastAPI inference** (`services/inference-api`) + **Next.js studio** 
 | Doc | Use when |
 |-----|----------|
 | **This README** | Install, run locally, deploy to GPU VM, test |
+| [docs/CODEBASE.md](./docs/CODEBASE.md) | **Onboarding map** — modules, paths, what to read first |
+| [docs/CONTRIBUTING.md](./docs/CONTRIBUTING.md) | PR workflow, contract checklist, code conventions |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | System design, jobs loop, limitations |
 | [LLD.md](./LLD.md) | Modules and API detail |
+| [services/inference-api/README.md](./services/inference-api/README.md) | API env vars and endpoint reference |
+| [apps/web/README.md](./apps/web/README.md) | Next.js routes and studio UI layout |
+| [scripts/README.md](./scripts/README.md) | Spheron deploy scripts and Makefile targets |
 
 ---
 
