@@ -1,0 +1,80 @@
+# --- OS / editor ---
+.DS_Store
+**/.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-*
+
+# --- Python ---
+.venv/
+venv/
+env/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+.tox/
+.nox/
+.dmypy.json
+dmypy.json
+
+# --- ML weights & caches (never commit) ---
+/models/
+**/.cache/
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+*.onnx
+
+# --- Generated / local outputs ---
+generated/
+spheron_sync.tgz
+benchmarks/product_similarity/results/
+**/test_output.jpg
+**/output.jpg
+services/inference-api/*.jpg
+services/inference-api/*.png
+
+# --- Node / Next.js ---
+**/node_modules/
+**/.next/
+**/out/
+**/dist/
+**/.turbo/
+.vercel
+*.tsbuildinfo
+**/next-env.d.ts
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# --- Env & secrets ---
+.env
+.env.*
+!.env.example
+!.env.spheron.example
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.spheron.example
+
+# --- Logs ---
+*.log
+logs/
