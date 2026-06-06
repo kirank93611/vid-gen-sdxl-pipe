@@ -20,7 +20,7 @@ class GenerateRequest(BaseModel):
     This class is the API contract for POST /generate input.
     FastAPI + Pydantic validate this before inference runs.
     """
-    # Forbid unknown fields so deferred features (ex: lora_path) fail fast.
+    # Reject unknown JSON fields (clients must use lora_name, not raw paths).
     model_config = ConfigDict(extra="forbid")
 
     # Required text description of target image.
@@ -46,11 +46,54 @@ class GenerateRequest(BaseModel):
     clip_skip: Annotated[int, Field(default=2, ge=1, le=4)]
     scheduler: str = Field(default="dpm++2m_karras")
 
-    # tier field
+    model_id: str | None = Field(
+        default=None,
+        description="Image backend: sdxl_base or ckpt_<checkpoint_stem> (SD 1.5 single file).",
+    )
+    generation_profile: (
+        Literal[
+            "custom",
+            "lightning_4",
+            "lightning_8",
+            "sdxl_fast",
+            "sdxl_balanced",
+            "sdxl_quality",
+            "sd15_standard",
+        ]
+        | None
+    ) = Field(
+        default=None,
+        description="Preset block merged onto request. Auto lightning_4 when LoRA name contains 'lightning'.",
+    )
+
+    # tier field (legacy — maps to sdxl_* profiles when generation_profile unset)
     quality_tier: Literal["fast", "balanced", "quality"] | None = Field(
         default=None,
         description="When set, server maps this to steps and guidance_scale (see router.py).",
     )
+
+    lora_name: str | None = Field(
+        default=None,
+        description="LoRA catalog id → models/loras/<lora_name>.safetensors on disk.",
+    )
+    lora_weight: Annotated[float, Field(default=0.8, ge=0.0, le=2.0)]
+
+    @field_validator("scheduler")
+    @classmethod
+    def validate_scheduler(cls, v: str) -> str:
+        allowed = {"dpm++2m_karras", "euler", "euler_trailing"}
+        if v not in allowed:
+            raise ValueError(f"Unsupported scheduler: {v}. Use one of: {sorted(allowed)}")
+        return v
+
+    @field_validator("lora_name")
+    @classmethod
+    def validate_lora_name_field(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        from lora_utils import validate_lora_name
+
+        return validate_lora_name(v)
 
 class GenerateResponse(BaseModel):
     """
@@ -182,6 +225,31 @@ class JobCreateRequest(BaseModel):
         default=None,
         description="Optional inpaint mask (white=repaint). Auto center mask if goal.use_inpaint_correction.",
     )
+    lora_name: str | None = Field(
+        default=None,
+        description="Optional LoRA id (models/loras/<name>.safetensors). Generate steps only.",
+    )
+    lora_weight: Annotated[float, Field(default=0.8, ge=0.0, le=2.0)]
+    model_id: str | None = Field(
+        default=None,
+        description="sdxl_base or ckpt_<stem> for SD 1.5 checkpoints.",
+    )
+    generation_profile: (
+        Literal[
+            "custom",
+            "lightning_4",
+            "lightning_8",
+            "sdxl_fast",
+            "sdxl_balanced",
+            "sdxl_quality",
+            "sd15_standard",
+        ]
+        | None
+    ) = None
+    steps: Annotated[int | None, Field(default=None, ge=1, le=40)] = None
+    guidance_scale: Annotated[float | None, Field(default=None, ge=0.0, le=12.0)] = None
+    scheduler: str | None = None
+    clip_skip: Annotated[int | None, Field(default=None, ge=1, le=4)] = None
 
 
 class JobCreateResponse(BaseModel):
@@ -196,6 +264,10 @@ class JobStatusResponse(BaseModel):
     goal: VisualGoal
     iterations: list[JobIterationRecord] = Field(default_factory=list)
     image_base64: str | None = None
+    image_url: str | None = Field(
+        default=None,
+        description="GET path for final JPEG on disk (smaller than base64 in JSON).",
+    )
     metadata: dict[str, Any] | None = None
     error_code: str | None = None
     message: str | None = None

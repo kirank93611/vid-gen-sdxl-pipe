@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from schemas import GenerateRequest, InpaintRequest
-from router import apply_quality_tier
+from generation_profiles import apply_generation_policy
 
 TIER_ORDER = ("fast", "balanced", "quality")
 
 
 def effective_request(req: GenerateRequest) -> tuple[GenerateRequest, str]:
-    """Apply quality_tier policy then return (effective_request, model_id)."""
-    return apply_quality_tier(req)
+    """Apply generation_profile / quality_tier policy."""
+    return apply_generation_policy(req)
 
 
 def effective_inpaint_request(req: InpaintRequest) -> tuple[GenerateRequest, str]:
@@ -23,7 +23,7 @@ def effective_inpaint_request(req: InpaintRequest) -> tuple[GenerateRequest, str
         width=req.width,
         height=req.height,
     )
-    return apply_quality_tier(gen)
+    return apply_generation_policy(gen)
 
 
 def bump_quality_tier(current: str | None) -> str | None:
@@ -55,5 +55,8 @@ def build_metadata(
         "scheduler": effective.scheduler,
         "seed": used_seed,
         "model_id": model_id,
+        "generation_profile": payload.generation_profile or payload.quality_tier,
         "quality_tier": payload.quality_tier,
+        "lora_name": effective.lora_name,
+        "lora_weight": effective.lora_weight if effective.lora_name else None,
     }

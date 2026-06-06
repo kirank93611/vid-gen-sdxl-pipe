@@ -1,45 +1,20 @@
-export type ApiErr = {
-  message?: string;
-  error_code?: string | null;
-  request_id?: string;
-};
+/** Re-exports — prefer @/lib/api/* and @/lib/studio/* for new code. */
 
-export type GenerateOk = {
-  status: string;
-  image_base64: string;
-  metadata?: Record<string, unknown>;
-};
+export type { ApiErr } from "@/lib/api/errors";
+export { formatApiError } from "@/lib/api/errors";
 
-export type JobStatus = {
-  status: string;
-  image_base64?: string | null;
-  iterations?: {
-    attempt: number;
-    passed: boolean;
-    correction?: string | null;
-  }[];
-  message?: string | null;
-  error_code?: string | null;
-};
+export type {
+  ImageModelEntry,
+  LoraCatalogEntry,
+  GenerationProfileEntry,
+} from "@/lib/api/catalog";
+export {
+  fetchImageModels,
+  fetchLoraCatalog,
+  fetchGenerationProfiles,
+} from "@/lib/api/catalog";
 
-export function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      const comma = result.indexOf(",");
-      resolve(comma >= 0 ? result.slice(comma + 1) : result);
-    };
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
-}
+export type { GenerationMetadata, GenerateOk, JobStatus } from "@/lib/api/generate";
+export { formatGenerationMeta, fileToBase64 } from "@/lib/api/generate";
 
-export function formatApiError(
-  err: ApiErr,
-  fallback: string,
-  statusText?: string,
-): string {
-  const msg = err.message ?? statusText ?? fallback;
-  return err.error_code ? `${msg} (${err.error_code})` : msg;
-}
+export type { GeneratePayload } from "@/lib/studio/types";

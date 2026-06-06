@@ -1,66 +1,83 @@
-# Web app (Next.js studio)
-
-Product UI and Route Handler proxies to the inference API. No GPU code in this package.
-
-## Setup
-
-```bash
-cd apps/web
-cp .env.example .env.local
-npm install
-```
-
-| Variable | Purpose |
-|----------|---------|
-| `SDXL_API_URL` | Inference base URL for `/api/generate` |
-| `SDXL_JOBS_URL` | Inference base URL for `/api/jobs` |
-| `SDXL_API_KEY` | Server-side key forwarded as `X-API-Key` |
-
-## Run
-
-```bash
-npm run dev:local   # http://localhost:3001 — avoids VM SSH tunnel on :3000
-npm run build && npm run start   # production on :3000
-```
-
-## Routes
-
-| Path | Type | Purpose |
-|------|------|---------|
-| `/` | Client | Studio editor (`StudioEditor` + bottom dock) |
-| `/chat` | Client | GGUF chat — model picker + conversation |
-| `/explore` | Server | Marketing / hero |
-| `/studio` | Redirect | → `/` |
-| `/api/generate` | Route Handler | Proxy to `POST /generate` |
-| `/api/jobs` | Route Handler | Proxy to `POST /jobs` |
-| `/api/jobs/[jobId]` | Route Handler | Proxy to `GET /jobs/{id}` |
-
-## Source layout
-
-```text
-src/
-├── app/                    App Router pages and API routes
-├── components/studio/      Editor: canvas, generation dock, layout
-├── components/ui/          shadcn/ui primitives
-└── lib/
-    ├── studio-api.ts       Typed fetch + error formatting
-    └── studio-constants.ts  Quality tiers, aspect ratios, defaults
-```
-
-**Largest UI file:** `components/studio/generation-dock.tsx` — generate vs product-job modes, polling, reference upload.
-
-## Design system
-
-- Tailwind + shadcn/ui
-- Theme tokens in `src/app/globals.css` (lime accent studio look)
-- Motion via `framer-motion` in studio components
-
-## Contract with backend
-
-Do not duplicate request field definitions by hand long-term — prefer OpenAPI codegen into `lib/api-types` when the API stabilizes. Until then, keep `studio-api.ts` in sync with `services/inference-api/schemas.py`.
-
-## Production / VM notes
-
-If you SSH-tunnel the VM web process to local port 3000, run local dev on **3001** (`dev:local`). Mixing `next dev` HTML with `next start` static chunks causes `/_next/static` 500 errors — rebuild with `rm -rf .next && npm run build`.
-
-Deploy on GPU VM: `make deploy-web` from repo root (see [scripts/README.md](../../scripts/README.md)).
+# Web app (Next.js studio)
+
+Product UI and BFF proxies to the inference API. No GPU code in this package.
+
+**Ops:** [docs/RUNBOOK-SPHERON.md](../../docs/RUNBOOK-SPHERON.md) · **Models:** [docs/MODELS.md](../../docs/MODELS.md)
+
+## Setup
+
+```bash
+cd apps/web
+cp .env.example .env.local
+npm install
+```
+
+| Variable | Purpose |
+|----------|---------|
+| `SDXL_INFERENCE_BASE` | API origin (catalog, health) |
+| `SDXL_API_URL` | `POST /generate` |
+| `SDXL_JOBS_URL` | Jobs API |
+| `SDXL_API_KEY` | Server-side `X-API-Key` |
+| `SDXL_FETCH_TIMEOUT_MS` | Proxy timeout (`600000+` for quality) |
+
+## Run
+
+```bash
+npm run dev          # http://localhost:3000
+npm run dev:local    # :3001 if :3000 is SSH tunnel
+```
+
+Tunnel API: `ssh -L 8001:127.0.0.1:8001 ubuntu@<VM_IP>`
+
+## Routes
+
+| Path | Purpose |
+|------|---------|
+| `/` | Studio editor |
+| `/chat` | GGUF chat |
+| `/explore` | Marketing |
+| `/api/generate` | Proxy generate |
+| `/api/jobs/*` | Proxy jobs + artifact |
+| `/api/models` | Model catalog |
+| `/api/loras` | LoRA catalog |
+| `/api/generation-profiles` | Presets from API |
+| `/api/chat` | Chat completion |
+
+## Source layout
+
+```text
+src/
+├── app/                      App Router + API routes
+├── components/
+│   ├── studio/
+│   │   ├── dock/             Minibar + (future) settings panel splits
+│   │   ├── generation-dock.tsx
+│   │   ├── studio-editor.tsx, studio-canvas.tsx
+│   │   └── chat-interface.tsx
+│   └── ui/                   shadcn
+└── lib/
+    ├── api/                  Inference clients (prefer for new code)
+    │   ├── inference-config.ts
+    │   ├── errors.ts
+    │   ├── catalog.ts        models, loras, profiles
+    │   └── generate.ts       types + formatGenerationMeta
+    └── studio/               UI-only defaults + helpers
+        ├── defaults.ts       aspects, prompts, schedulers
+        ├── model-utils.ts    ckpt_ detection
+        └── profile-utils.ts  apply preset from API profile
+```
+
+Legacy barrels `studio-api.ts` and `studio-constants.ts` re-export from `lib/api` and `lib/studio` — migrate imports over time.
+
+## Contract with backend
+
+- **Source of truth:** `services/inference-api/schemas.py` + `GET /openapi.json`
+- **Do not duplicate** generation profile numbers in TS — use `fetchGenerationProfiles()`
+- Future: OpenAPI codegen → `packages/shared/` per ADR-0001
+
+## Deploy
+
+VM: `bash scripts/spheron_deploy_web.sh` or `make deploy-web`
+
+See [docs/RUNBOOK-SPHERON.md](../../docs/RUNBOOK-SPHERON.md) for troubleshooting.
+

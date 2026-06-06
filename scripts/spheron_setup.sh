@@ -35,7 +35,7 @@ fi
 python -c "import torch; print('cuda:', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 
 echo "==> App dependencies"
-pip install -q fastapi uvicorn diffusers transformers accelerate pydantic pillow huggingface_hub httpx safetensors
+pip install -q fastapi uvicorn diffusers transformers accelerate pydantic pillow huggingface_hub httpx safetensors peft
 
 echo "==> SDXL weights (download on VM — faster than rsync from Mac)"
 MODEL_DIR="${SDXL_MODEL_PATH:-$REPO_ROOT/models/sdxl-base}"

@@ -244,16 +244,46 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics["generate_timeout_total"], 1)
         self.assertEqual(metrics["generate_inflight"], 0)
 
-    async def test_generate_rejects_deferred_lora_fields(self) -> None:
+    async def test_generate_rejects_invalid_lora_name(self) -> None:
         resp = await self.client.post(
             "/generate",
-            json={"prompt": "test", "lora_path": "string"},
+            json={"prompt": "test", "lora_name": "../etc/passwd"},
             headers=self.API_HEADERS,
         )
-
         self.assertEqual(resp.status_code, 422)
-        body = resp.json()
-        self.assertEqual(body["detail"][0]["type"], "extra_forbidden")
+
+    async def test_generate_lora_not_on_disk_returns_400(self) -> None:
+        resp = await self.client.post(
+            "/generate",
+            json={"prompt": "test", "lora_name": "missing_lora_file"},
+            headers=self.API_HEADERS,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["error_code"], "lora_not_found")
+
+    async def test_list_loras_endpoint(self) -> None:
+        resp = await self.client.get("/loras")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("loras", resp.json())
+
+    async def test_list_generation_profiles_endpoint(self) -> None:
+        resp = await self.client.get("/generation-profiles")
+        self.assertEqual(resp.status_code, 200)
+        ids = {p["profile_id"] for p in resp.json()["profiles"]}
+        self.assertIn("lightning_4", ids)
+        self.assertIn("custom", ids)
+
+    async def test_generate_lightning_profile_metadata(self) -> None:
+        resp = await self.client.post(
+            "/generate",
+            json={"prompt": "lightning", "generation_profile": "lightning_4"},
+            headers=self.API_HEADERS,
+        )
+        self.assertEqual(resp.status_code, 200)
+        meta = resp.json()["metadata"]
+        self.assertEqual(meta["steps"], 4)
+        self.assertEqual(meta["guidance_scale"], 0.0)
+        self.assertEqual(meta["scheduler"], "euler_trailing")
 
     async def test_generate_without_api_key_returns_401(self) -> None:
         resp = await self.client.post("/generate", json={"prompt": "test"})
@@ -367,6 +397,51 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["iterations"][0]["passed"], False)
         self.assertEqual(body["iterations"][-1]["passed"], True)
         self.assertIsNotNone(body.get("image_base64"))
+        self.assertEqual(body.get("image_url"), f"/jobs/{job_id}/artifact")
+
+    async def test_job_persisted_after_memory_cache_clear(self) -> None:
+        """Simulates API restart: SQLite + files remain; RAM cache is empty."""
+        create = await self.client.post(
+            "/jobs",
+            json={
+                "goal": {"realism": "high"},
+                "prompt": "persist test",
+                "quality_tier": "fast",
+                "max_iterations": 3,
+            },
+            headers=self.API_HEADERS,
+        )
+        self.assertEqual(create.status_code, 202)
+        job_id = create.json()["job_id"]
+
+        body: dict = {}
+        for _ in range(50):
+            await asyncio.sleep(0.05)
+            status = await self.client.get(f"/jobs/{job_id}", headers=self.API_HEADERS)
+            body = status.json()
+            if body["status"] in ("converged", "failed", "error"):
+                break
+        else:
+            self.fail("job did not finish in time")
+
+        self.assertEqual(body["status"], "converged")
+
+        import jobs as jobs_module
+
+        jobs_module.clear_memory_cache_for_tests()
+
+        reloaded = await self.client.get(f"/jobs/{job_id}", headers=self.API_HEADERS)
+        self.assertEqual(reloaded.status_code, 200)
+        reloaded_body = reloaded.json()
+        self.assertEqual(reloaded_body["status"], "converged")
+        self.assertEqual(reloaded_body.get("image_url"), f"/jobs/{job_id}/artifact")
+
+        artifact = await self.client.get(
+            f"/jobs/{job_id}/artifact",
+            headers=self.API_HEADERS,
+        )
+        self.assertEqual(artifact.status_code, 200)
+        self.assertEqual(artifact.content, b"fake-jpeg-bytes")
 
     async def test_job_with_clip_reference_converges_when_similarity_improves(self) -> None:
         import base64 as b64

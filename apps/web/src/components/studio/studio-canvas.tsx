@@ -4,21 +4,25 @@ import { motion, AnimatePresence } from "framer-motion";
 import { ImageIcon, Loader2 } from "lucide-react";
 
 import { Skeleton } from "@/components/ui/skeleton";
+import { cn } from "@/lib/utils";
 
 type StudioCanvasProps = {
   imageSrc: string | null;
   loading?: boolean;
   metaLine?: string | null;
+  dockMinimized?: boolean;
 };
 
 export function StudioCanvas({
   imageSrc,
   loading = false,
   metaLine,
+  dockMinimized = false,
 }: StudioCanvasProps) {
   return (
-    <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center px-4 pb-4 pt-6 sm:px-8">
-      <div className="mb-6 text-center">
+    <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center px-4 pb-2 pt-4 sm:px-8 sm:pt-6">
+      {!imageSrc && !loading && (
+      <div className="mb-4 text-center sm:mb-6">
         <motion.h1
           initial={{ opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
@@ -38,6 +42,7 @@ export function StudioCanvas({
           correction loop on GPU.
         </motion.p>
       </div>
+      )}
 
       <div className="relative flex w-full max-w-4xl flex-1 items-center justify-center">
         <AnimatePresence mode="wait">
@@ -68,7 +73,12 @@ export function StudioCanvas({
               <img
                 src={imageSrc}
                 alt="Generated frame"
-                className="max-h-[min(58vh,640px)] w-auto object-contain"
+                className={cn(
+                  "w-auto object-contain",
+                  dockMinimized
+                    ? "max-h-[min(78vh,900px)]"
+                    : "max-h-[min(52vh,640px)]",
+                )}
                 decoding="async"
               />
             </motion.div>
@@ -92,14 +102,35 @@ export function StudioCanvas({
         </AnimatePresence>
       </div>
 
-      {metaLine && (
-        <motion.p
+      {(metaLine || loading) && (
+        <motion.div
           initial={{ opacity: 0, y: 4 }}
           animate={{ opacity: 1, y: 0 }}
-          className="mt-4 font-mono text-[11px] text-muted-foreground"
+          className="mt-4 max-w-2xl text-center"
         >
-          {metaLine}
-        </motion.p>
+          {metaLine ? (
+            <p className="font-mono text-[11px] leading-relaxed text-muted-foreground">
+              {metaLine.split(" · ").map((part, i) => (
+                <span key={`${part}-${i}`}>
+                  {i > 0 && " · "}
+                  {part.startsWith("LoRA ") ? (
+                    <span className="font-medium text-[var(--studio-lime)]">
+                      {part}
+                    </span>
+                  ) : part === "no LoRA" ? (
+                    <span className="text-muted-foreground/80">{part}</span>
+                  ) : (
+                    part
+                  )}
+                </span>
+              ))}
+            </p>
+          ) : loading ? (
+            <p className="font-mono text-[11px] text-muted-foreground">
+              Waiting for GPU metadata…
+            </p>
+          ) : null}
+        </motion.div>
       )}
     </div>
   );
