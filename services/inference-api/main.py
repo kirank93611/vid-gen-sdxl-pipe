@@ -15,7 +15,7 @@ import time
 import uuid
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from api_auth import require_api_key
 from api_config import (
@@ -25,6 +25,7 @@ from api_config import (
     EXPECTED_API_KEY,
     GENERATION_TIMEOUT_SECONDS,
     INPAINT_STRENGTH,
+    LORAS_DIR,
     MAX_INFLIGHT_GENERATIONS,
     RATE_LIMIT_REQUESTS,
     RATE_LIMIT_WINDOW_SECONDS,
@@ -32,13 +33,17 @@ from api_config import (
 )
 from chat_service import chat_completion, load_chat_model
 from api_logging import configure_logging, log_error, log_info
-from model_catalog import get_chat_model, list_capabilities, list_models_payload
+from checkpoint_utils import is_checkpoint_model_id, resolve_checkpoint_path
+from model_catalog import get_chat_model, list_capabilities
+from model_registry import list_all_models
 from device import get_runtime_device
 from generation_service import generate_image_bytes, inpaint_image_bytes
+import job_store
 import jobs as jobs_module
+from lora_utils import list_lora_names, resolve_lora_path
 from rate_limit import check_and_record_rate_limit
 from registry import EngineRegistry
-from router import apply_quality_tier
+from router import apply_generation_policy, list_profiles_payload, model_supports_lora
 from schemas import (
     ChatRequest,
     ChatResponse,
@@ -68,6 +73,7 @@ jobs_module.configure(
     _generate_semaphore,
     inpaint_strength=INPAINT_STRENGTH,
 )
+jobs_module.init_persistence()
 
 _metrics: dict[str, int | float] = {
     "requests_total": 0,
@@ -83,6 +89,14 @@ _metrics: dict[str, int | float] = {
     "generate_accepted_total": 0,
     "generate_timeout_total": 0,
 }
+
+
+def _release_generate_slot(start: float) -> None:
+    duration_ms = (time.perf_counter() - start) * 1000
+    with _metrics_lock:
+        _metrics["generate_latency_ms_total"] += duration_ms
+        _metrics["generate_inflight"] -= 1
+    _generate_semaphore.release()
 
 
 def _rate_limited_response(request_id: str) -> JSONResponse:
@@ -193,17 +207,79 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
     if not check_and_record_rate_limit(provided_api_key):
         return _rate_limited_response(request_id)
 
-    # 1. Count every attempt first
     with _metrics_lock:
         _metrics["generate_requests_total"] += 1
 
-    # 2. Capacity gate
-    # Capacity gate controls concurrent in-flight work (different from per-key rate limiting).
+    _effective, model_id = apply_generation_policy(payload)
+
+    if payload.lora_name:
+        if not model_supports_lora(model_id):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "error_code": "lora_not_supported",
+                    "message": "LoRAs apply to SDXL base only, not SD 1.5 checkpoints.",
+                    "request_id": request_id,
+                },
+                headers={"X-Request-ID": request_id},
+            )
+        try:
+            resolve_lora_path(payload.lora_name)
+        except FileNotFoundError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "error_code": "lora_not_found",
+                    "message": str(exc),
+                    "request_id": request_id,
+                },
+                headers={"X-Request-ID": request_id},
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "status": "error",
+                    "error_code": "invalid_lora_name",
+                    "message": str(exc),
+                    "request_id": request_id,
+                },
+                headers={"X-Request-ID": request_id},
+            )
+
+    try:
+        if is_checkpoint_model_id(model_id):
+            resolve_checkpoint_path(model_id)
+    except FileNotFoundError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "error_code": "checkpoint_not_found",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+    except ValueError as exc:
+        log_error(logger, "POST /generate rejected reason=unsupported_model_id", request_id)
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "error",
+                "error_code": "unsupported_model_id",
+                "message": str(exc),
+                "request_id": request_id,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+
     acquired = _generate_semaphore.acquire(blocking=False)
     if not acquired:
         with _metrics_lock:
             _metrics["generate_rejected_total"] += 1
-        request_id = getattr(http_request.state, "request_id", "unknown")
         log_error(logger, "POST /generate rejected reason=capacity_reached", request_id)
 
         response = JSONResponse(
@@ -219,26 +295,9 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
         response.headers["X-Request-ID"] = request_id
         return response
 
-    # 3. Accepted path
     with _metrics_lock:
         _metrics["generate_accepted_total"] += 1
         _metrics["generate_inflight"] += 1
-
-    _effective, model_id = apply_quality_tier(payload)
-    try:
-        registry.get_engine(model_id)
-    except ValueError as exc:
-        log_error(logger, "POST /generate rejected reason=unsupported_model_id", request_id)
-        return JSONResponse(
-            status_code=422,
-            content={
-                "status": "error",
-                "error_code": "unsupported_model_id",
-                "message": str(exc),
-                "request_id": request_id,
-            },
-            headers={"X-Request-ID": request_id},
-        )
 
     start = time.perf_counter()
     try:
@@ -250,7 +309,6 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
     except asyncio.TimeoutError:
         with _metrics_lock:
             _metrics["generate_timeout_total"] += 1
-        request_id = getattr(http_request.state, "request_id", "unknown")
         log_error(logger, "POST /generate timed out", request_id)
         response = JSONResponse(
             status_code=504,
@@ -263,24 +321,32 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
         )
         response.headers["X-Request-ID"] = request_id
         return response
+    except RuntimeError as exc:
+        with _metrics_lock:
+            _metrics["generate_error_total"] += 1
+        log_error(logger, f"POST /generate failed reason=checkpoint_load {exc}", request_id)
+        response = JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "error_code": "checkpoint_load_failed",
+                "message": "Could not load SD 1.5 checkpoint on GPU",
+                "request_id": request_id,
+                "details": str(exc) if APP_ENV == "dev" else None,
+            },
+        )
+        response.headers["X-Request-ID"] = request_id
+        return response
     except Exception:
         with _metrics_lock:
             _metrics["generate_error_total"] += 1
         raise
     finally:
-        duration_ms = (time.perf_counter() - start) * 1000
-        with _metrics_lock:
-            _metrics["generate_latency_ms_total"] += duration_ms
-            _metrics["generate_inflight"] -= 1
-        _generate_semaphore.release()
+        _release_generate_slot(start)
 
     with _metrics_lock:
         _metrics["generate_success_total"] += 1
 
-
-    
-
-    # Encode raw bytes to Base64 (Stateless Delivery)
     image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
     return GenerateResponse(
@@ -445,6 +511,49 @@ async def get_job_status(
             },
         )
     return record
+
+
+@app.get(
+    "/jobs/{job_id}/artifact",
+    response_model=None,
+    responses={401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+)
+async def get_job_artifact(
+    job_id: str,
+    http_request: Request,
+) -> FileResponse | JSONResponse:
+    """Download the final JPEG for a job (saved on disk during the correction loop)."""
+    unauthorized = require_api_key(http_request)
+    if unauthorized is not None:
+        return unauthorized
+
+    record = jobs_module.get_job(job_id)
+    if record is None:
+        request_id = getattr(http_request.state, "request_id", "unknown")
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "error_code": "job_not_found",
+                "message": f"Unknown job_id: {job_id}",
+                "request_id": request_id,
+            },
+        )
+
+    path = job_store.artifact_file_path(job_id)
+    if path is None:
+        request_id = getattr(http_request.state, "request_id", "unknown")
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "error_code": "artifact_not_found",
+                "message": "Job has no saved image yet (still running or failed without output)",
+                "request_id": request_id,
+            },
+        )
+
+    return FileResponse(path, media_type="image/jpeg", filename=f"{job_id}.jpg")
 
 
 @app.get("/metrics", response_model=None)
@@ -684,8 +793,20 @@ async def load_chat_model_endpoint(
 
 @app.get("/models")
 async def list_models() -> dict[str, list]:
-    """Dynamic model catalog (image + chat), including on_disk status."""
-    return {"models": list_models_payload()}
+    """Dynamic model catalog (SDXL, SD1.5 checkpoints, chat)."""
+    return {"models": list_all_models()}
+
+
+@app.get("/generation-profiles")
+async def list_generation_profiles() -> dict[str, list]:
+    """Composable preset blocks for steps / CFG / scheduler."""
+    return {"profiles": list_profiles_payload()}
+
+
+@app.get("/loras")
+async def list_loras() -> dict:
+    """Local LoRA catalog (models/loras/*.safetensors on disk). No auth — filenames only."""
+    return {"loras": list_lora_names(), "lora_dir": str(LORAS_DIR)}
 
 
 @app.get("/capabilities")

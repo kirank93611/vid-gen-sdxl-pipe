@@ -18,6 +18,7 @@ from diffusers import (
 )
 from schemas import GenerateRequest
 from device import resolve_torch_device
+from lora_utils import resolve_lora_path
 
 
 class GenerationCancelledError(Exception):
@@ -31,6 +32,9 @@ SCHEDULERS: dict[str, SchedulerFactory] = {
         cfg, use_karras_sigmas=True
     ),
     "euler": lambda cfg: EulerDiscreteScheduler.from_config(cfg),
+    "euler_trailing": lambda cfg: EulerDiscreteScheduler.from_config(
+        cfg, timestep_spacing="trailing"
+    ),
 }
 
 
@@ -45,6 +49,7 @@ class SDXLEngine:
         self.pipeline: StableDiffusionXLPipeline | None = None
         self.inpaint_pipeline: StableDiffusionXLInpaintPipeline | None = None
         self._lock = threading.Lock()
+        self._active_lora_key: tuple[str, float] | None = None
         self.load_model()
 
     def load_model(self) -> None:
@@ -68,11 +73,49 @@ class SDXLEngine:
         )
         print(f"Model initialized on {self.device}.")
 
+    def _clear_lora(self, pipeline: StableDiffusionXLPipeline | StableDiffusionXLInpaintPipeline) -> None:
+        try:
+            if hasattr(pipeline, "unfuse_lora"):
+                pipeline.unfuse_lora()
+        except Exception:
+            pass
+        try:
+            pipeline.unload_lora_weights()
+        except Exception:
+            pass
+        self._active_lora_key = None
+
+    def _apply_lora(
+        self,
+        pipeline: StableDiffusionXLPipeline | StableDiffusionXLInpaintPipeline,
+        req: GenerateRequest,
+    ) -> None:
+        if not req.lora_name:
+            if self._active_lora_key is not None:
+                self._clear_lora(pipeline)
+            return
+
+        key = (req.lora_name, req.lora_weight)
+        if key == self._active_lora_key:
+            return
+
+        self._clear_lora(pipeline)
+        path = resolve_lora_path(req.lora_name)
+        pipeline.load_lora_weights(str(path.parent), weight_name=path.name)
+        try:
+            pipeline.fuse_lora(lora_scale=req.lora_weight)
+        except Exception:
+            adapters = pipeline.get_list_adapters() if hasattr(pipeline, "get_list_adapters") else {}
+            names = list(adapters.keys()) if adapters else ["default_0"]
+            pipeline.set_adapters(names, adapter_weights=[req.lora_weight])
+        self._active_lora_key = key
+
     def unload(self) -> None:
         """Release GPU weights (registry calls this when switching to GGUF chat)."""
         with self._lock:
             self.pipeline = None
             self.inpaint_pipeline = None
+            self._active_lora_key = None
 
     def generate(
         self,
@@ -87,6 +130,7 @@ class SDXLEngine:
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         with self._lock:
+            self._apply_lora(self.pipeline, req)
             self.pipeline.scheduler = SCHEDULERS[req.scheduler](
                 self.pipeline.scheduler.config
             )

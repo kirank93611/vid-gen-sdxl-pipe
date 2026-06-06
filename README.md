@@ -5,6 +5,10 @@ Monorepo: **FastAPI inference** (`services/inference-api`) + **Next.js studio** 
 | Doc | Use when |
 |-----|----------|
 | **This README** | Install, run locally, deploy to GPU VM, test |
+| [docs/MODELS.md](./docs/MODELS.md) | **Plug-and-play** — LoRAs, checkpoints, catalog, profiles |
+| [docs/LORAS.md](./docs/LORAS.md) | Download Civitai LoRAs → VM, `lora_name` in API/UI |
+| [docs/CHECKPOINTS.md](./docs/CHECKPOINTS.md) | SD 1.5 checkpoints (URPM, etc.) |
+| [docs/RUNBOOK-SPHERON.md](./docs/RUNBOOK-SPHERON.md) | **Spheron SSH, sync, weights, tunnel** (Windows + Mac) |
 | [docs/CODEBASE.md](./docs/CODEBASE.md) | **Onboarding map** — modules, paths, what to read first |
 | [docs/CONTRIBUTING.md](./docs/CONTRIBUTING.md) | PR workflow, contract checklist, code conventions |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | System design, jobs loop, limitations |
@@ -23,8 +27,9 @@ Monorepo: **FastAPI inference** (`services/inference-api`) + **Next.js studio** 
 | `models/sdxl-base/` | SDXL 1.0 weights (~6.5 GB) |
 | `apps/web/node_modules/` | After `npm install` |
 | `apps/web/.env.local` | Copy from `.env.example` |
+| `.env.spheron` | Spheron VM IP + SSH private key path (copy from `.env.spheron.example`) |
 
-**Never commit:** `.venv`, `models/`, `node_modules/`, `.next/`, `generated/`, `benchmarks/.../results/`, `.env.local`.
+**Never commit:** `.venv`, `models/`, `node_modules/`, `.next/`, `generated/`, `.env.spheron`, `spheron_sync.tgz`, `benchmarks/.../results/`, `.env.local`.
 
 Clean artifacts: `make clean`
 
@@ -98,15 +103,58 @@ Open **http://localhost:3001** — lime header, bottom **Generate** dock, **Prod
 
 ---
 
+## A2. Local Windows (develop & test)
+
+### 1. Python (one-time)
+
+Install **Python 3.12+** from [python.org](https://www.python.org/downloads/) with **Add to PATH** checked. Disable Windows Store python aliases (Settings → App execution aliases).
+
+```powershell
+cd E:\path\to\sdxl
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pip install diffusers uvicorn accelerate
+```
+
+If `Activate.ps1` is blocked: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+
+Download SDXL weights (once) — same Python one-liner as Mac section A, or run setup on Spheron instead.
+
+### 2. Run inference API
+
+```powershell
+$env:GENERATION_TIMEOUT_SECONDS = "300"
+cd services\inference-api
+python -m uvicorn main:app --host 127.0.0.1 --port 8001
+```
+
+### 3. Run web UI
+
+```powershell
+cd apps\web
+copy .env.example .env.local
+npm install
+npm run dev
+```
+
+Open http://localhost:3000 — CPU inference is slow; use Spheron for GPU (section B2).
+
+---
+
 ## B. Spheron GPU VM (production test)
 
-Run **`make spheron-*` on your Mac only** — not inside the VM SSH session.
+Full runbook: **[docs/RUNBOOK-SPHERON.md](./docs/RUNBOOK-SPHERON.md)** (SSH keys, sync, weights, tunnel, troubleshooting).
 
-**Spot VMs get a new IP every deploy.** Set it once per instance:
+**Spot VMs get a new IP every deploy.** Update `.env.spheron` (or `make spheron-set-ip` on Mac).
+
+### B1. Mac / Linux
+
+Run **`make spheron-*` from your laptop** — not inside the VM SSH session.
 
 ```bash
 cp .env.spheron.example .env.spheron
-make spheron-set-ip IP=216.81.248.248          # writes .env.spheron (gitignored)
+make spheron-set-ip IP=<VM_IP>          # writes .env.spheron (gitignored)
 # optional: SPM_USER=ubuntu make spheron-set-ip IP=...
 ```
 
@@ -118,6 +166,36 @@ make spheron-set-ip IP=216.81.248.248          # writes .env.spheron (gitignored
 | `make spheron-up` | **Same disk**, new IP (skip model/torch if present) | ~5–15 min |
 | `make spheron-deploy` | Code + restart API + rebuild web | ~5–15 min |
 | `make spheron-tunnel` | Browser → studio + API | — |
+
+### B2. Windows (PowerShell)
+
+**1. SSH key (one-time)** — generate on PC, add `.pub` to Spheron:
+
+```powershell
+ssh-keygen -t ed25519 -f C:\Users\YOU\.ssh\id_ed25519
+type C:\Users\YOU\.ssh\id_ed25519.pub
+```
+
+**2. Config** — copy `.env.spheron.example` → `.env.spheron`, set `SPHERON_IP` and `SPHERON_SSH_KEY`.
+
+**3. First-time setup** (sync + PyTorch + SDXL download + start API, ~15–25 min):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\spheron_windows_setup.ps1
+```
+
+**4. Tunnel** (leave open; keeps `apps/web/.env.local` on `127.0.0.1`):
+
+```powershell
+ssh -i C:\Users\YOU\.ssh\id_ed25519 `
+  -L 8001:127.0.0.1:8001 `
+  -L 3000:127.0.0.1:3000 `
+  ubuntu@<VM_IP>
+```
+
+**5. Browser:** http://127.0.0.1:3000 (web on VM) **or** `npm run dev` locally with tunnel on `:8001` only.
+
+**New IP:** edit `SPHERON_IP` in `.env.spheron`, run `ssh-keygen -R <IP>`, reconnect. Fresh disk → re-run setup script.
 
 ### First time on a fresh VM (empty disk)
 
@@ -216,7 +294,8 @@ make spheron-benchmark
 | `scripts/spheron_restart_api.sh` | VM | Restart API (waits for `/health`) |
 | `scripts/spheron_deploy_web.sh` | VM | Kill :3000, `npm run build`, `next start` |
 | `scripts/spheron_vm_bootstrap.sh` | VM | setup + API + smoke generate |
-| `scripts/spheron_generate.py` | VM/Mac | One `/generate` smoke test |
+| `scripts/spheron_generate.py` | VM/Mac/Win | One `/generate` smoke test |
+| `scripts/spheron_windows_setup.ps1` | **Windows** | SSH test, tarball sync, setup, start API |
 | `scripts/run_product_benchmark.py` | Mac/VM | Product CLIP benchmark |
 | `scripts/run_product_job.py` | Mac/VM | CLI product job with reference file |
 
@@ -227,7 +306,10 @@ make spheron-benchmark
 - `POST /generate` — single image (`quality_tier`: fast / balanced / quality)
 - `POST /jobs` — correction loop (`goal.preserve_product`, `reference_image_base64`, optional `goal.use_inpaint_correction`)
 - `POST /inpaint` — mask + init image
-- `GET /jobs/{id}` — poll job status
+- `GET /jobs/{id}` — poll job status (`image_url` preferred)
+- `GET /jobs/{id}/artifact` — download final JPEG from disk
+- `GET /loras` — list `models/loras/*.safetensors` on the API host
+- Optional: `lora_name`, `lora_weight` on `/generate` and `/jobs` — see [docs/LORAS.md](./docs/LORAS.md)
 - Auth: `X-API-Key: dev-local-key`
 
 Example product job:
@@ -255,6 +337,11 @@ curl -sS -X POST "http://127.0.0.1:8001/jobs" \
 
 | Symptom | Fix |
 |---------|-----|
+| `Permission denied (publickey)` to Spheron | Private key file missing on PC; add matching `.pub` to **this** VM — see [RUNBOOK-SPHERON.md](./docs/RUNBOOK-SPHERON.md) |
+| `REMOTE HOST IDENTIFICATION HAS CHANGED` | `ssh-keygen -R <VM_IP>` then reconnect |
+| `Python was not found` (Windows) | Install Python 3.12+ to PATH; disable Store aliases; use `.venv\Scripts\python.exe` |
+| `pipefail: invalid option` on VM | CRLF in shell scripts — fixed by `spheron_windows_setup.ps1` or `sed -i 's/\r$//'` on `scripts/*.sh` |
+| Generate uses CPU not GPU | Run API on Spheron; tunnel `:8001` — do not run uvicorn on Windows for production tests |
 | Old purple sidebar UI | VM still on old `next` process — `make deploy-web` on VM; browser http://127.0.0.1:3000 + hard refresh |
 | `422 use_inpaint_correction` | API not restarted — `make deploy-api` on VM after sync |
 | `EADDRINUSE :3000` | `fuser -k 3000/tcp` then `make deploy-web` |
@@ -273,5 +360,7 @@ curl -sS -X POST "http://127.0.0.1:8001/jobs" \
 | `GENERATION_TIMEOUT_SECONDS` | `90` | Use `300` on GPU / quality tiers |
 | `SDXL_API_KEY` | `dev-local-key` | Match `apps/web/.env.local` |
 | `SDXL_MODEL_PATH` | `./models/sdxl-base` | |
+| `ARTIFACTS_DIR` | `./generated` | Job SQLite + JPEG artifacts |
+| `JOB_DB_PATH` | `./generated/jobs.db` | Job persistence |
 
 Web proxy (`apps/web/.env.local`): `SDXL_API_URL`, `SDXL_JOBS_URL`, `SDXL_API_KEY`, `SDXL_FETCH_TIMEOUT_MS` — see `.env.example`.

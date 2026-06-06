@@ -28,20 +28,25 @@ Defines the API contracts:
 
 This layer protects the inference engine from invalid input shapes and keeps response/error formats explicit.
 
-### `services/inference-api/router.py`
+### `services/inference-api/router.py` / `generation_profiles.py`
 
-Maps `quality_tier` (`fast` | `balanced` | `quality`) to concrete `steps` and `guidance_scale` before inference. Returns `(effective_request, model_id)`; today `model_id` is always `sdxl_base`. Does not load alternate checkpoints yet.
+Maps `generation_profile` (and legacy `quality_tier`) to concrete `steps`, `guidance_scale`, `scheduler`, etc. Returns `(effective_request, model_id)`. Supports `sdxl_base`, `ckpt_*` checkpoints, and LoRA fields on SDXL.
 
-### `services/inference-api/engine.py`
+### Plug-and-play assets
 
-Owns the SDXL runtime:
+| Module | Role |
+|--------|------|
+| `model_catalog.py` | Registered SDXL + GGUF chat models |
+| `checkpoint_utils.py` | Filesystem SD 1.5 checkpoints → `ckpt_<stem>` |
+| `lora_utils.py` | Filesystem LoRAs → `lora_name` |
+| `model_registry.py` | Unified `GET /models` payload |
+| `registry.py` | Lazy engine load, VRAM eviction on switch |
 
-- loads the local SDXL model from `<repo root>/models/sdxl-base` (or `SDXL_MODEL_PATH`)
-- keeps the pipeline in memory
-- serializes mutable pipeline access with an internal lock
-- returns image bytes through `io.BytesIO`
+See [docs/MODELS.md](./docs/MODELS.md) for drop-in paths and ops.
 
-This module is the only place that should know about model internals.
+### `services/inference-api/engine.py` / `sd15_engine.py`
+
+Own SDXL and SD 1.5 runtimes (diffusers). SDXL supports LoRA fuse/unfuse and inpaint. Checkpoints use `StableDiffusionPipeline.from_single_file`.
 
 ### `services/inference-api/main.py`
 
@@ -57,14 +62,33 @@ Owns API orchestration:
 
 This file should remain focused on transport, policy, and observability rather than model logic.
 
+### `services/inference-api/job_store.py`
+
+Persists correction jobs across API restarts:
+
+- **SQLite** at `generated/jobs.db` (`JOB_DB_PATH`) — full `JobStatusResponse` snapshots (without inline image bytes)
+- **JPEG artifacts** at `generated/jobs/<job_id>/output.jpg` (`ARTIFACTS_DIR`)
+- **`recover_interrupted_jobs()`** on startup — `queued` / `running` jobs become `error` with `error_code=server_restarted`
+
+`jobs.py` writes through on every status change; `GET /jobs/{id}/artifact` serves the file.
+
 ### `apps/web/`
 
-Next.js **Visual Studio** shell (shadcn/ui, Higgsfield-style bottom dock): `/` editor, `/explore` home. Server proxies:
+Next.js **Visual Studio**: `/` editor, `/chat` GGUF chat, `/explore` marketing. Server proxies under `src/app/api/` forward to inference (generate, jobs, models, loras, generation-profiles, chat).
 
-- `POST /api/generate` → inference `/generate`
-- `POST /api/jobs`, `GET /api/jobs/[jobId]` → inference `/jobs`
+Layout:
 
-Secrets stay in `.env.local` (`SDXL_API_KEY`, `SDXL_API_URL`, `SDXL_JOBS_URL`). No torch in the browser.
+```text
+apps/web/src/
+├── app/                 Routes + BFF proxies
+├── components/studio/   Editor UI (dock/, canvas, chat)
+├── components/ui/       shadcn
+└── lib/
+    ├── api/             Catalog + generate clients, errors, inference config
+    └── studio/          UI defaults, model helpers, profile utils
+```
+
+Secrets: `.env.local` (`SDXL_API_KEY`, `SDXL_INFERENCE_BASE`). No torch in the browser.
 
 **Deploy:** `scripts/spheron_deploy_web.sh` on GPU VM; `make spheron-deploy` from Mac. See [README.md](./README.md).
 
@@ -86,10 +110,10 @@ flowchart TD
     E --> Auth["API key + rate limit"]
     Auth --> F["Backpressure Check"]
     F -->|Rejected| G["429 capacity_reached or rate_limited"]
-    F -->|Accepted| T["apply_quality_tier"]
+    F -->|Accepted| T["apply_generation_policy"]
     T --> H["run_in_executor"]
-    H --> I["SDXLEngine.generate(effective)"]
-    I --> K["SDXL Inference on MPS"]
+    H --> I["EngineRegistry → SDXL or SD15"]
+    I --> K["Inference on CUDA/MPS"]
     K --> L["BytesIO -> Base64 + metadata"]
     L --> M["200 Success Response"]
     H -->|Timeout| N["504 generation_timeout"]
@@ -224,6 +248,7 @@ Completed since initial milestone list:
 - **`DEVICE` env** — `cuda` / `mps` / `cpu` (`device.py`); `/health` reports runtime device
 - **Spheron runbooks** — `scripts/spheron_*.sh`, `make spheron-deploy`, `make deploy-api` / `make deploy-web` on VM
 - **Studio UI refresh** — bottom dock, product job tab, lime theme (`apps/web/src/components/studio/`)
+- **Persisted jobs + artifact files** — `job_store.py` (SQLite + `generated/jobs/`), `image_url` on `JobStatusResponse`, `GET /jobs/{id}/artifact`
 
 Next planned milestones:
 
@@ -231,7 +256,6 @@ Next planned milestones:
 2. **Reference-conditioned generation** — IP-Adapter / composite (reference today is CLIP-only, not pixel lock)
 3. VLM rubric evaluator (composition, artifacts, readable text, etc.)
 4. Thin planner LLM over fixed tools (goal → capability graph, not CFG knobs)
-5. Persisted job store + artifact URLs (in-memory jobs lost on restart)
 
 ## Design layers (intent vs execution)
 
@@ -255,16 +279,19 @@ sequenceDiagram
     participant C as Client
     participant API as FastAPI
     participant J as jobs.py
+    participant S as job_store
     participant E as evaluator
     participant P as correction
     participant A as SDXL adapter + engine
 
     C->>API: POST /jobs {goal, prompt, quality_tier}
     API-->>C: 202 job_id queued
+    J->>S: save_job queued
     J->>A: generate (attempt 1)
     A-->>J: image bytes + effective params
     J->>E: evaluate_output(goal, effective)
     E-->>J: passed / issues[]
+    J->>S: save_job iteration update
     alt not passed
         J->>P: resolve_correction (tier bump or inpaint)
         alt tier bump
@@ -274,16 +301,43 @@ sequenceDiagram
             J->>A: inpaint on last image
         end
     end
+    J->>S: save_artifact output.jpg
     J-->>J: status converged | failed | error
     C->>API: GET /jobs/{job_id}
-    API-->>C: iterations[], image_base64?
+    API-->>C: iterations[], image_url, image_base64?
+    C->>API: GET /jobs/{job_id}/artifact
+    API-->>C: JPEG file
+```
+
+### Job persistence (survives API restart)
+
+```mermaid
+flowchart LR
+    subgraph RAM["In-process"]
+        J[jobs.py worker]
+        M[_jobs memory cache]
+    end
+
+    subgraph Disk["Gitignored generated/"]
+        DB[(jobs.db SQLite)]
+        IMG[jobs/job_id/output.jpg]
+    end
+
+    J -->|every status change| M
+    J -->|write-through| DB
+    J -->|on converge/fail| IMG
+    API[GET /jobs/id] --> M
+    API -->|cache miss| DB
+    API2[GET /jobs/id/artifact] --> IMG
 ```
 
 | Status | Meaning |
 |--------|---------|
 | `converged` | Evaluator passed within `max_iterations` |
 | `failed` | `error_code=convergence_failed` — no patch left or still failing |
-| `error` | `generation_timeout`, `capacity_reached`, `internal_error`, etc. |
+| `error` | `generation_timeout`, `capacity_reached`, `internal_error`, `server_restarted`, etc. |
+
+**Job outputs:** `JobStatusResponse.image_url` (preferred, e.g. `/jobs/{id}/artifact`) plus optional `image_base64` for backward compatibility. Artifacts live under `ARTIFACTS_DIR` (default `<repo>/generated/`).
 
 **Evaluator v0** — rule-based tier/steps vs `VisualGoal` (policy escalation).
 
@@ -293,7 +347,7 @@ sequenceDiagram
 
 **Product expectation:** reference improves measurable CLIP and localized refinement; **faithful product composite** needs reference-conditioned generation (planned).
 
-Stable error codes: `convergence_failed`, `job_not_found` (additive; do not rename without changelog).
+Stable error codes: `convergence_failed`, `job_not_found`, `artifact_not_found`, `server_restarted` (additive; do not rename without changelog).
 
 ### Benchmark harness (experimental proof)
 
@@ -308,7 +362,7 @@ Outputs: `benchmarks/product_similarity/results/latest.json` and `latest.md` (gi
 
 ## End-to-end architecture (current vs target)
 
-### Today (M3 Pro MVP — synchronous)
+### Today (M3 Pro MVP — sync generate + async jobs)
 
 ```mermaid
 flowchart TB
@@ -317,35 +371,54 @@ flowchart TB
         WEB[Next.js apps/web]
     end
 
-    subgraph Edge
-        RH[Route Handler POST /api/generate]
+    subgraph Edge["apps/web Route Handlers"]
+        RH[POST /api/generate]
+        RJ[POST/GET /api/jobs]
+        RA[GET /api/jobs/id/artifact]
     end
 
     subgraph Inference["services/inference-api"]
         MW[Middleware: X-Request-ID + metrics]
         AUTH[API key + rate limit]
-        VAL[Pydantic GenerateRequest]
+        VAL[Pydantic validation]
         RT[router.apply_quality_tier]
         BP[Semaphore: MAX_INFLIGHT=1]
         EX[run_in_executor]
-        ENG[SDXLEngine singleton]
-        MPS[PyTorch diffusers on MPS]
+        JOBS[jobs.py worker]
+        STORE[job_store.py]
+        REG[EngineRegistry]
+        ENG[SDXLEngine]
+        MPS[PyTorch diffusers on MPS/CUDA]
     end
 
-    subgraph Local["MacBook M3 Pro"]
-        RAM[(Unified memory)]
-        WEIGHTS[(models/sdxl-base on disk)]
+    subgraph Local["Host disk — gitignored"]
+        RAM[(Unified memory / VRAM)]
+        WEIGHTS[(models/sdxl-base)]
+        JDB[(generated/jobs.db)]
+        JIMG[(generated/jobs/id/output.jpg)]
     end
 
     U --> WEB
     WEB --> RH
-    RH -->|HTTP + X-API-Key server-side| MW
+    WEB --> RJ
+    WEB --> RA
+    RH -->|POST /generate| MW
+    RJ -->|POST/GET /jobs| MW
+    RA -->|GET /jobs/id/artifact| MW
     MW --> AUTH --> VAL --> RT --> BP
-    BP -->|accepted| EX --> ENG
+    BP -->|sync path| EX --> REG --> ENG
+    MW -->|async path| JOBS
+    JOBS --> BP
+    JOBS --> REG
+    JOBS -->|write-through| STORE
+    STORE --> JDB
+    JOBS -->|converged JPEG| JIMG
+    RA --> JIMG
     ENG --> MPS
     MPS --> RAM
-    ENG -.->|load at startup| WEIGHTS
-    MPS -->|JPEG base64 JSON| WEB
+    ENG -.-> WEIGHTS
+    RH -->|base64 JSON| WEB
+    RJ -->|status + image_url| WEB
 ```
 
 ### Target (M3 Pro learning path → Spheron-ready)
@@ -365,7 +438,9 @@ flowchart TB
     subgraph API["FastAPI inference-api"]
         SYNC[POST /generate sync — keep for simple calls]
         JOBS[POST /jobs async — multi-step / long runs]
-        Q[Job queue + worker loop]
+        ART[GET /jobs/id/artifact]
+        Q[In-process job worker]
+        STORE[job_store SQLite + JPEG artifacts]
         ADM[RAM / inflight admission]
         REG[Engine registry]
         RT[quality_tier + model_id router]
@@ -387,6 +462,8 @@ flowchart TB
     POL -->|tool: generate / inpaint / segment| JOBS
     POL -->|single-shot| SYNC
     JOBS --> Q --> ADM --> REG
+    Q --> STORE
+    ART --> STORE
     SYNC --> ADM --> REG
     RT --> REG
     REG -->|load on demand; unload previous| E1
@@ -404,27 +481,32 @@ flowchart TB
 sequenceDiagram
     participant C as Client
     participant API as FastAPI
-    participant Q as Job queue
-    participant W as Worker
+    participant J as jobs.py
+    participant S as job_store
     participant R as Engine registry
     participant G as GPU engine
 
     C->>API: POST /jobs {prompt, quality_tier, plan?}
-    API->>API: auth, validate, enqueue
+    API->>API: auth, validate
+    API->>J: create_job
+    J->>S: save_job queued
     API-->>C: 202 {job_id, status: queued}
 
-    W->>Q: claim next job
-    W->>W: check RAM / inflight policy
+    J->>J: asyncio worker + semaphore
     alt need different model
-        W->>R: unload current / load model_id
+        J->>R: unload current / load model_id
         R->>G: load weights from disk or volume
     end
-    W->>G: generate(effective_request)
-  G-->>W: image bytes + metadata
-    W->>Q: status succeeded + artifact ref
+    J->>G: generate / inpaint / evaluate loop
+    G-->>J: image bytes + metadata
+    J->>S: save_artifact output.jpg
+    J->>S: save_job converged
 
     C->>API: GET /jobs/{job_id}
-    API-->>C: status + image_base64 or URL
+    API->>S: load_job on cache miss
+    API-->>C: status + image_url + iterations
+    C->>API: GET /jobs/{job_id}/artifact
+    API-->>C: JPEG file
 ```
 
 ## Tech debt (explicit)
@@ -434,10 +516,10 @@ sequenceDiagram
 | **Device** | `DEVICE` env via `device.py` (done) | Multi-GPU routing not supported | Document per-host defaults in README |
 | **Model loading** | `EngineRegistry` lazy per `model_id` | OOM if multiple pipelines; no unload yet | `unload()`; max one resident on Mac |
 | **Routing** | `quality_tier` → steps/CFG only; always `sdxl_base` weights | “fast tier” without Lightning weights is misleading | Separate `model_id` from tier; honest 503 if weights missing |
-| **API shape** | Sync `/generate` + in-process **jobs** (no external queue) | Jobs lost on restart | Persist job store; artifact URLs |
+| **API shape** | Sync `/generate` + in-process **jobs** (no external queue) | No Redis/SQS; single-process worker | External queue later if multi-instance |
 | **Correction** | Rules + CLIP + tier/inpaint on jobs | Inpaint does not composite reference SKU | IP-Adapter / mask composite; tune timeouts per host |
 | **Orchestration** | None (client → API) | Agent logic inside `main.py` | New module `orchestrator/` or external service; **tools** call inference API |
-| **Artifacts** | Base64 in JSON | Huge payloads; bad for multi-step | Job result: file URL / object storage key on cloud |
+| **Artifacts** | SQLite + local JPEG + `image_url`; base64 still returned | Single-host disk only; no CDN | Object storage URLs on cloud; drop base64 from JSON when clients migrated |
 | **Metrics** | Global counters | Cannot compare models/tiers | Label metrics by `model_id`, `quality_tier`, job status |
 | **Health** | `optimization: lightning` vs **base** weights on disk | Ops confusion | Health reports `model_id`, `device`, `loaded_models` |
 | **Deploy** | README + `spheron_*` scripts (SSH/rsync) | No Dockerfile / IaC yet | Container image; health checks in orchestrator |

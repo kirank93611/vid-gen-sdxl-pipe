@@ -44,6 +44,7 @@ dmypy.json
 
 # --- Generated / local outputs ---
 generated/
+spheron_sync.tgz
 benchmarks/product_similarity/results/
 **/test_output.jpg
 **/output.jpg
@@ -68,9 +69,11 @@ yarn-error.log*
 .env
 .env.*
 !.env.example
+!.env.spheron.example
 **/.env
 **/.env.*
 !**/.env.example
+!**/.env.spheron.example
 
 # --- Logs ---
 *.log

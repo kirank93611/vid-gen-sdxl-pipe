@@ -1,4 +1,8 @@
-"""In-memory correction jobs: generate → evaluate → correct (bounded iterations)."""
+"""Correction jobs: generate → evaluate → correct (bounded iterations).
+
+Persistence: status snapshots go to SQLite (job_store.py); final images to disk.
+An in-memory cache (_jobs) keeps reads fast; every mutation writes through to disk.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from correction import resolve_correction
 from evaluator import decode_reference, evaluate_output
 from generation_service import generate_image_bytes, inpaint_image_bytes
+import job_store
 from image_utils import (
     decode_image_bytes,
     decode_mask_base64,
@@ -42,6 +47,16 @@ _inpaint_strength: float = 0.85
 _semaphore: threading.Semaphore | None = None
 
 
+def init_persistence() -> None:
+    """Call once at API startup (see main.py)."""
+    from api_config import ARTIFACTS_DIR, JOB_DB_PATH
+
+    job_store.init_job_store(db_path=JOB_DB_PATH, artifacts_root=ARTIFACTS_DIR)
+    recovered = job_store.recover_interrupted_jobs()
+    if recovered:
+        logger.info("marked %s interrupted jobs as error after restart", recovered)
+
+
 def configure(
     registry: EngineRegistry,
     timeout_seconds: float,
@@ -56,6 +71,13 @@ def configure(
     _inpaint_strength = inpaint_strength
 
 
+def _update_job(record: JobStatusResponse) -> None:
+    """Memory cache + SQLite — single place for all job state writes."""
+    with _store_lock:
+        _jobs[record.job_id] = record
+    job_store.save_job(record)
+
+
 def create_job(payload: JobCreateRequest) -> JobStatusResponse:
     job_id = str(uuid.uuid4())
     record = JobStatusResponse(
@@ -64,32 +86,59 @@ def create_job(payload: JobCreateRequest) -> JobStatusResponse:
         goal=payload.goal,
         iterations=[],
     )
-    with _store_lock:
-        _jobs[job_id] = record
+    _update_job(record)
     return record
 
 
 def get_job(job_id: str) -> JobStatusResponse | None:
     with _store_lock:
-        return _jobs.get(job_id)
+        cached = _jobs.get(job_id)
+    if cached is not None:
+        return cached
+    record = job_store.load_job(job_id)
+    if record is None:
+        return None
+    with _store_lock:
+        _jobs[job_id] = record
+    return record
 
 
 def reset_store_for_tests() -> None:
-    """Clear in-memory jobs between integration tests."""
+    """Clear in-memory jobs and on-disk test store between integration tests."""
     with _store_lock:
         _jobs.clear()
         _tasks.clear()
+    job_store.reset_job_store_for_tests()
+
+
+def clear_memory_cache_for_tests() -> None:
+    """Simulate API restart: memory empty, SQLite + files still on disk."""
+    with _store_lock:
+        _jobs.clear()
 
 
 def _to_generate_request(payload: JobCreateRequest) -> GenerateRequest:
-    return GenerateRequest(
-        prompt=payload.prompt,
-        negative_prompt=payload.negative_prompt,
-        quality_tier=payload.quality_tier,
-        seed=payload.seed,
-        width=payload.width,
-        height=payload.height,
-    )
+    fields: dict[str, object] = {
+        "prompt": payload.prompt,
+        "negative_prompt": payload.negative_prompt,
+        "quality_tier": payload.quality_tier,
+        "seed": payload.seed,
+        "width": payload.width,
+        "height": payload.height,
+        "lora_name": payload.lora_name,
+        "lora_weight": payload.lora_weight,
+        "model_id": payload.model_id,
+        "generation_profile": payload.generation_profile,
+    }
+    if payload.steps is not None:
+        fields["steps"] = payload.steps
+    if payload.guidance_scale is not None:
+        fields["guidance_scale"] = payload.guidance_scale
+    if payload.scheduler is not None:
+        fields["scheduler"] = payload.scheduler
+    if payload.clip_skip is not None:
+        fields["clip_skip"] = payload.clip_skip
+    return GenerateRequest(**fields)  # type: ignore[arg-type]
 
 
 def _resolve_mask_bytes(payload: JobCreateRequest, image_bytes: bytes | None) -> bytes | None:
@@ -237,20 +286,30 @@ def _append_iteration(
                 correction=correction,
             )
         )
+    _update_job(record)
 
 
 def _set_status(job_id: str, status: str) -> None:
     with _store_lock:
-        _jobs[job_id].status = status  # type: ignore[assignment]
+        record = _jobs[job_id]
+        record.status = status  # type: ignore[assignment]
+    _update_job(record)
+
+
+def _attach_image(record: JobStatusResponse, image_bytes: bytes) -> None:
+    record.image_url = job_store.save_artifact(record.job_id, image_bytes)
+    # Keep base64 for older clients; new clients should prefer image_url.
+    record.image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
 
 def _set_converged(job_id: str, image_bytes: bytes, metadata: dict[str, Any]) -> None:
     with _store_lock:
         record = _jobs[job_id]
         record.status = "converged"
-        record.image_base64 = base64.b64encode(image_bytes).decode("utf-8")
         record.metadata = metadata
         record.message = "Goal criteria met"
+        _attach_image(record, image_bytes)
+    _update_job(record)
 
 
 def _set_failed(job_id: str, image_bytes: bytes | None, metadata: dict[str, Any] | None) -> None:
@@ -260,9 +319,10 @@ def _set_failed(job_id: str, image_bytes: bytes | None, metadata: dict[str, Any]
         record.error_code = "convergence_failed"
         record.message = "Max iterations reached without passing evaluation"
         if image_bytes is not None:
-            record.image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+            _attach_image(record, image_bytes)
         if metadata is not None:
             record.metadata = metadata
+    _update_job(record)
 
 
 def _set_error(job_id: str, error_code: str, message: str) -> None:
@@ -271,3 +331,4 @@ def _set_error(job_id: str, error_code: str, message: str) -> None:
         record.status = "error"
         record.error_code = error_code
         record.message = message
+    _update_job(record)

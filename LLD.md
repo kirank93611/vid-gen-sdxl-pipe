@@ -21,6 +21,7 @@ flowchart TB
         Explore[src/app/explore/page.tsx]
         ProxyGen[src/app/api/generate/route.ts]
         ProxyJobs[src/app/api/jobs/route.ts]
+        ProxyArt[src/app/api/jobs/jobId/artifact/route.ts]
     end
 
     subgraph APITier["services/inference-api — FastAPI"]
@@ -29,11 +30,15 @@ flowchart TB
         Schemas[schemas.py]
         Router[router.py]
         Registry[registry.py]
+        Jobs[jobs.py worker]
+        Store[job_store.py]
         Engine[engine.py SDXLEngine]
     end
 
     subgraph DataTier["Local data — gitignored"]
         Weights[(models/sdxl-base)]
+        JobDB[(generated/jobs.db)]
+        JobImg[(generated/jobs/id/output.jpg)]
         Env[.env / .env.local]
     end
 
@@ -41,14 +46,20 @@ flowchart TB
     Browser --> Explore
     Page -->|POST /api/generate or /api/jobs| ProxyGen
     Page --> ProxyJobs
+    Page -->|GET /api/jobs/id/artifact| ProxyArt
     ProxyGen -->|POST /generate + X-API-Key| MW
     ProxyJobs -->|POST/GET /jobs + X-API-Key| MW
+    ProxyArt -->|GET /jobs/id/artifact| MW
     MW --> Routes
     Routes --> Schemas
     Routes --> Router
+    Routes --> Jobs
+    Jobs --> Store
     Routes --> Registry
     Registry --> Engine
     Engine --> Weights
+    Store --> JobDB
+    Store --> JobImg
     ProxyGen -.->|SDXL_API_URL SDXL_API_KEY| Env
     ProxyJobs -.->|SDXL_JOBS_URL| Env
 ```
@@ -63,13 +74,18 @@ flowchart LR
     schemas[schemas.py]
     router[router.py]
     registry[registry.py]
+    jobs[jobs.py]
+    store[job_store.py]
     engine[engine.py]
     client[client.py]
 
     main --> schemas
     main --> router
     main --> registry
-    main --> engine
+    main --> jobs
+    main --> store
+    jobs --> store
+    jobs --> schemas
     registry --> engine
     router --> schemas
     engine --> schemas
@@ -82,7 +98,9 @@ flowchart LR
 | `router.py` | `schemas` | torch, FastAPI |
 | `engine.py` | torch, diffusers, `schemas` | FastAPI Request/Response |
 | `registry.py` | `engine` | FastAPI |
-| `main.py` | FastAPI, `schemas`, `router`, `registry`/`engine` | diffusers pipeline internals |
+| `job_store.py` | `schemas`, sqlite3, pathlib | torch, FastAPI |
+| `jobs.py` | `job_store`, `schemas`, evaluator, generation_service | FastAPI Request/Response |
+| `main.py` | FastAPI, `schemas`, `router`, `registry`, `jobs`, `job_store` | diffusers pipeline internals |
 | `client.py` | httpx/requests | — |
 
 ---
@@ -155,6 +173,7 @@ classDiagram
 | `POST` | `/generate` | `X-API-Key` | `200` / `401` / `422` / `429` / `500` / `504` |
 | `POST` | `/jobs` | `X-API-Key` | `202` / `401` / `422` / `429` |
 | `GET` | `/jobs/{job_id}` | `X-API-Key` | `200` / `401` / `404` |
+| `GET` | `/jobs/{job_id}/artifact` | `X-API-Key` | `200` JPEG / `401` / `404` |
 | `POST` | `/inpaint` | `X-API-Key` | `200` / `401` / `422` / `429` / `504` |
 | — | `/docs` | No | OpenAPI UI |
 
@@ -166,7 +185,9 @@ classDiagram
 | 422 | (validation) | Pydantic / unknown fields |
 | 422 | `unsupported_model_id` | Registry rejects `model_id` |
 | 404 | `job_not_found` | Unknown `job_id` on `GET /jobs/{id}` |
+| 404 | `artifact_not_found` | Job exists but no JPEG on disk yet |
 | (job body) | `convergence_failed` | Job `status=failed` after max iterations |
+| (job body) | `server_restarted` | Job was `queued`/`running` when API restarted |
 | 429 | `rate_limited` | Per-key sliding window exceeded |
 | 429 | `capacity_reached` | Semaphore `MAX_INFLIGHT_GENERATIONS` |
 | 500 | `internal_error` | Unhandled exception |
@@ -197,6 +218,8 @@ classDiagram
 | `SDXL_FETCH_TIMEOUT_MS` | `apps/web` route | `600000` | Proxy read timeout |
 | `DEVICE` | `device.py` | auto (`cuda`/`mps`/`cpu`) | Inference device |
 | `INPAINT_STRENGTH` | `main.py` / jobs | `0.85` | SDXL inpaint denoise strength |
+| `ARTIFACTS_DIR` | `api_config.py` | `<repo>/generated` | Job JPEG root |
+| `JOB_DB_PATH` | `api_config.py` | `<repo>/generated/jobs.db` | SQLite job snapshots |
 | `GENERATION_TIMEOUT_SECONDS` | `main.py`, jobs | `90` | Wall-clock per GPU step |
 | `GENERATION_CANCEL_GRACE_SECONDS` | `generation_service.py` | `120` | Drain GPU thread after timeout |
 
@@ -333,12 +356,18 @@ flowchart TD
 sequenceDiagram
     participant UI as StudioEditor + generation-dock
     participant RH as POST /api/generate
-    participant API as FastAPI /generate
+    participant RJ as GET /api/jobs/id/artifact
+    participant API as FastAPI
 
     UI->>RH: fetch JSON prompt optional quality_tier
-    RH->>API: POST + X-API-Key from env
+    RH->>API: POST /generate + X-API-Key from env
     API-->>RH: status body headers
     RH-->>UI: pass-through status + x-request-id
+    Note over UI,RJ: After job converges
+    UI->>RJ: GET artifact proxy
+    RJ->>API: GET /jobs/id/artifact + X-API-Key
+    API-->>RJ: JPEG bytes
+    RJ-->>UI: image for canvas
 ```
 
 | Concern | Design |
@@ -346,6 +375,7 @@ sequenceDiagram
 | API key | Server-only `SDXL_API_KEY`, never `NEXT_PUBLIC_` |
 | Body | Transparent JSON forward |
 | Errors | Upstream JSON + status preserved |
+| Job images | Prefer `image_url` → `/api/jobs/{id}/artifact` over inline base64 |
 
 ---
 
@@ -367,13 +397,13 @@ flowchart LR
         D8[evaluator + correction loop]
         D9[POST /inpaint + job inpaint step]
         D10[DEVICE env + spheron deploy scripts]
+        D11[job_store SQLite + artifact URLs]
     end
 
     subgraph Planned["LLD target"]
         P1[reference-conditioned gen IP-Adapter]
         P2[VLM rubric evaluator]
         P3[planner over tools]
-        P4[persisted jobs + artifact URLs]
     end
 
     Done --> Done2
@@ -384,7 +414,7 @@ flowchart LR
 
 ## 12. Correction jobs (implemented MVP)
 
-In-process worker (`jobs.py`); state is **lost on process restart**.
+In-process worker (`jobs.py`) with **write-through persistence** (`job_store.py`). Job metadata survives API restart; final images are JPEG files under `generated/jobs/<job_id>/`.
 
 ### HTTP
 
@@ -392,19 +422,21 @@ In-process worker (`jobs.py`); state is **lost on process restart**.
 |--------|------|---------|-------|
 | POST | `/jobs` | 202 | Body: `JobCreateRequest` |
 | GET | `/jobs/{job_id}` | 200 | `JobStatusResponse`; 404 `job_not_found` |
+| GET | `/jobs/{job_id}/artifact` | 200 | Final JPEG; 404 `artifact_not_found` if not written yet |
 | POST | `/inpaint` | 200 | Body: `InpaintRequest` (`image_base64`, `mask_base64`, `prompt`, …) |
 
 ### Schemas (additive)
 
 - `VisualGoal` — `realism`, `preserve_product`, `product_similarity_min`, `use_inpaint_correction`, `task`
 - `JobCreateRequest` — adds `reference_image_base64`, optional `mask_base64`
-- `JobCreateResponse`, `JobStatusResponse`, `JobIterationRecord` (`correction`: `generate` | `inpaint` | `tier_bump`), `EvalResult`
+- `JobCreateResponse`, `JobStatusResponse` (`image_url` preferred over inline base64), `JobIterationRecord` (`correction`: `generate` | `inpaint` | `tier_bump`), `EvalResult`
 - `InpaintRequest` — standalone inpaint endpoint
 
 ### Modules
 
 | Module | Role |
 |--------|------|
+| `job_store.py` | SQLite upsert, `save_artifact`, `recover_interrupted_jobs` on startup |
 | `evaluator.py` | Rules + optional CLIP when `reference_image_base64` set |
 | `clip_evaluator.py` | Lazy CLIP (`CLIP_MODEL_ID`, `CLIP_DEVICE`, `PRODUCT_SIMILARITY_MIN`) |
 | `correction.py` | `apply_corrections`, `resolve_correction` (tier vs inpaint) |
@@ -413,7 +445,7 @@ In-process worker (`jobs.py`); state is **lost on process restart**.
 | `image_utils.py` | Decode images/masks; `default_center_mask` for jobs |
 | `device.py` | `resolve_torch_device`, `get_runtime_device` |
 | `capabilities.py` | `text_to_image`, `quality_tier_routing`, `inpainting` |
-| `jobs.py` | Store, schedule, `generate → evaluate → correct` loop |
+| `jobs.py` | Memory cache + schedule, `generate → evaluate → correct` loop |
 
 ### Sequence
 
@@ -421,18 +453,26 @@ In-process worker (`jobs.py`); state is **lost on process restart**.
 sequenceDiagram
     participant C as Client
     participant API as FastAPI
-    participant Q as In-memory queue
-    participant W as Worker thread
+    participant J as jobs.py
+    participant S as job_store
+    participant W as GPU worker
     participant Reg as EngineRegistry
 
     C->>API: POST /jobs
-    API-->>C: 202 job_id queued
-    W->>Q: dequeue
+    API->>J: create_job
+    J->>S: save_job queued
+    API-->>C: 202 job_id
+    J->>W: asyncio task _run_job
     W->>Reg: get_engine per step
-    W->>W: run pipeline steps
-    W->>Q: status succeeded
+    W->>W: generate / inpaint / evaluate
+    J->>S: save_job each iteration
+    J->>S: save_artifact output.jpg
     C->>API: GET /jobs/id
-    API-->>C: artifact + metadata
+    API->>J: get_job
+    J->>S: load_job on cache miss
+    API-->>C: status, image_url, iterations
+    C->>API: GET /jobs/id/artifact
+    API-->>C: JPEG bytes
 ```
 
 ---
@@ -444,7 +484,7 @@ sequenceDiagram
 | `tests/test_router.py` | `apply_quality_tier` | No |
 | `tests/test_integration_api.py` | ASGI HTTP contract | Mocked `SDXLEngine` |
 
-Integration tests patch `SDXLEngine.load_model` / `generate` at import time. When `main.py` uses `registry`, tests should mock `registry.get_engine` (see Phase 1 wiring).
+Integration tests patch `SDXLEngine.load_model` / `generate` at import time. When `main.py` uses `registry`, tests should mock `registry.get_engine` (see Phase 1 wiring). Includes `test_job_persisted_after_memory_cache_clear` (SQLite + artifact survive simulated restart).
 
 ---
 
@@ -464,7 +504,9 @@ services/inference-api/
 ├── image_utils.py        # Masks, decode helpers
 ├── device.py             # DEVICE env
 ├── capabilities.py       # Capability manifest
-├── jobs.py               # Correction job store + worker
+├── jobs.py               # Correction job worker + memory cache
+├── job_store.py          # SQLite persistence + JPEG artifacts
+├── api_config.py         # Env vars (ARTIFACTS_DIR, JOB_DB_PATH, …)
 ├── engine.py             # SDXL txt2img + inpaint pipelines
 ├── client.py             # Sample HTTP client
 └── tests/

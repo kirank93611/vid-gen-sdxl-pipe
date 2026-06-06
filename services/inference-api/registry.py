@@ -10,6 +10,7 @@ import logging
 import threading
 from typing import Union
 
+from checkpoint_utils import is_checkpoint_model_id, resolve_checkpoint_path
 from device import resolve_torch_device
 from engine import SDXLEngine
 from gguf_engine import GGUFEngine
@@ -20,10 +21,11 @@ from model_catalog import (
     get_chat_model,
     get_image_model,
 )
+from sd15_engine import SD15Engine
 
 logger = logging.getLogger("sdxl_api")
 
-EngineT = Union[SDXLEngine, GGUFEngine]
+EngineT = Union[SDXLEngine, SD15Engine, GGUFEngine]
 
 
 class EngineRegistry:
@@ -46,22 +48,33 @@ class EngineRegistry:
             if mid != keep_id:
                 self._unload(mid)
 
-    def get_engine(self, model_id: str) -> SDXLEngine:
-        if model_id not in IMAGE_MODEL_IDS:
+    def get_engine(self, model_id: str) -> SDXLEngine | SD15Engine:
+        if model_id not in IMAGE_MODEL_IDS and not is_checkpoint_model_id(model_id):
             raise ValueError(f"Not an image model_id: {model_id}")
-        get_image_model(model_id)
+
         with self._lock:
             self._evict_all_except(model_id)
             if model_id not in self._engines:
                 logger.info("loading image engine model_id=%s", model_id)
-                spec = get_image_model(model_id)
-                path = str(spec.local_path) if spec.local_path.is_dir() else self._default_model_path
-                self._engines[model_id] = SDXLEngine(
-                    model_path=path,
-                    device=self._device,
-                )
+                if is_checkpoint_model_id(model_id):
+                    path = str(resolve_checkpoint_path(model_id))
+                    self._engines[model_id] = SD15Engine(
+                        checkpoint_path=path,
+                        device=self._device,
+                    )
+                else:
+                    spec = get_image_model(model_id)
+                    path = (
+                        str(spec.local_path)
+                        if spec.local_path.is_dir()
+                        else self._default_model_path
+                    )
+                    self._engines[model_id] = SDXLEngine(
+                        model_path=path,
+                        device=self._device,
+                    )
             eng = self._engines[model_id]
-        if not isinstance(eng, SDXLEngine):
+        if not isinstance(eng, (SDXLEngine, SD15Engine)):
             raise TypeError("engine type mismatch")
         return eng
 
