@@ -8,7 +8,7 @@ export const SETTING_HELP = {
   baseModel:
     "The main weights on GPU. SDXL base for LoRAs; checkpoints (e.g. URPM) are full SD 1.5 models — pick one, not both.",
   lora:
-    "Small add-on trained on SDXL base only. Lightning LoRA needs 4 steps + low CFG. Disabled when a checkpoint is selected.",
+    "Small add-on for a matching base model. SDXL LoRAs need SDXL base; LTX/Wan LoRAs need video bases (not wired in this studio yet).",
   profile:
     "Preset bundle for steps, CFG, and scheduler. Pick a preset then fine-tune numbers below — all fields are sent to the GPU.",
   aspect:
@@ -40,4 +40,6 @@ export const ERROR_HELP: Record<string, string> = {
     "SD 1.5 checkpoint failed to load on GPU (often a library version issue). Restart the API after syncing the latest code.",
   lora_not_found: "LoRA file missing on VM. Upload to models/loras/.",
   lora_not_supported: "LoRAs only work with SDXL base, not SD 1.5 checkpoints.",
+  lora_backend_mismatch:
+    "This LoRA needs a different base model (e.g. LTX or Wan). Switch base model or pick an SDXL LoRA.",
 };

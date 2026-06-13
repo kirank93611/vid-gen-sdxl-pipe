@@ -43,6 +43,12 @@ import {
   formatGenerationMeta,
 } from "@/lib/studio-api";
 import { SETTING_HELP } from "@/lib/studio-setting-help";
+import {
+  imageModelLoraBackend,
+  isLoraCompatibleWithModel,
+  loraBackendLabel,
+  type LoraBackend,
+} from "@/lib/studio/lora-utils";
 import { cn } from "@/lib/utils";
 
 type GenerationDockProps = {
@@ -126,7 +132,26 @@ export function GenerationDock({
   }, [cooldownSec]);
 
   const isCheckpoint = isCheckpointModelId(modelId);
+  const modelBackend = imageModelLoraBackend(modelId);
   const activeLora = isCheckpoint ? "" : loraName.trim();
+  const selectedLora = loras.find((l) => l.lora_name === activeLora);
+  const loraMismatch =
+    !!selectedLora &&
+    !!modelBackend &&
+    !isLoraCompatibleWithModel(
+      (selectedLora.backend ?? "sdxl") as LoraBackend,
+      modelId,
+    );
+  const compatibleLoras = loras.filter((l) =>
+    modelBackend
+      ? isLoraCompatibleWithModel((l.backend ?? "sdxl") as LoraBackend, modelId)
+      : false,
+  );
+  const incompatibleLoras = loras.filter(
+    (l) =>
+      modelBackend &&
+      !isLoraCompatibleWithModel((l.backend ?? "sdxl") as LoraBackend, modelId),
+  );
   const aspectDims = ASPECT_RATIOS.find((a) => a.id === aspect)!;
   const sdxlModels = imageModels.filter((m) => !isCheckpointModelId(m.model_id));
   const checkpointModels = imageModels.filter((m) => isCheckpointModelId(m.model_id));
@@ -162,6 +187,16 @@ export function GenerationDock({
     }
   }, [activeLora, applyPreset, isCheckpoint, modelId]);
 
+  useEffect(() => {
+    if (!loraMismatch || !activeLora) return;
+    setLoraName("");
+    onError(
+      `${activeLora} requires ${loraBackendLabel(
+        (selectedLora?.backend ?? "sdxl") as LoraBackend,
+      )} base — not compatible with ${modelKindLabel(modelId)}.`,
+    );
+  }, [activeLora, loraMismatch, modelId, onError, selectedLora?.backend]);
+
   function buildRequestBody() {
     const body: Record<string, unknown> = {
       prompt: prompt.trim(),
@@ -196,6 +231,12 @@ export function GenerationDock({
 
   const runGenerate = useCallback(async () => {
     if (submittingRef.current || cooldownSec > 0) return;
+    if (loraMismatch) {
+      onError(
+        "Selected LoRA does not match the base model. Pick an SDXL LoRA or switch to an LTX/Wan base.",
+      );
+      return;
+    }
     submittingRef.current = true;
     setLoading(true);
     onLoading(true);
@@ -255,6 +296,7 @@ export function GenerationDock({
     cooldownSec,
     guidanceScale,
     isCheckpoint,
+    loraMismatch,
     loraWeight,
     modelId,
     negativePrompt,
@@ -561,14 +603,48 @@ export function GenerationDock({
                     className={cn(fieldClass, isCheckpoint && "opacity-50")}
                   >
                     <option value="">
-                      {isCheckpoint ? "Not available for checkpoints" : "None (SDXL base)"}
+                      {isCheckpoint
+                        ? "Not available for checkpoints"
+                        : modelBackend
+                          ? `None (${loraBackendLabel(modelBackend)} base)`
+                          : "None"}
                     </option>
-                    {loras.map((l) => (
-                      <option key={l.lora_name} value={l.lora_name}>
-                        {l.lora_name}
-                      </option>
-                    ))}
+                    {compatibleLoras.length > 0 && (
+                      <optgroup
+                        label={
+                          modelBackend
+                            ? `${loraBackendLabel(modelBackend)} LoRAs`
+                            : "Compatible LoRAs"
+                        }
+                      >
+                        {compatibleLoras.map((l) => (
+                          <option key={l.lora_name} value={l.lora_name}>
+                            {l.lora_name}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
+                    {incompatibleLoras.length > 0 && (
+                      <optgroup label="Requires different base (not available)">
+                        {incompatibleLoras.map((l) => (
+                          <option
+                            key={l.lora_name}
+                            value={l.lora_name}
+                            disabled
+                          >
+                            {l.lora_name} — needs{" "}
+                            {loraBackendLabel((l.backend ?? "sdxl") as LoraBackend)}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
                   </select>
+                  {!isCheckpoint && incompatibleLoras.length > 0 && (
+                    <span className="text-[10px] text-amber-200/90">
+                      Video LoRAs (LTX/Wan) need a matching base model — only SDXL
+                      LoRAs work with SDXL base today.
+                    </span>
+                  )}
                   {lorasError && (
                     <button
                       type="button"

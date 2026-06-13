@@ -261,6 +261,19 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(resp.json()["error_code"], "lora_not_found")
 
+    async def test_generate_lora_backend_mismatch_returns_400(self) -> None:
+        with mock.patch(
+            "main.resolve_lora_path",
+            return_value=Path("/tmp/fake-lora.safetensors"),
+        ):
+            resp = await self.client.post(
+                "/generate",
+                json={"prompt": "test", "lora_name": "DR34ML4Y_LTXXX_V2"},
+                headers=self.API_HEADERS,
+            )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["error_code"], "lora_backend_mismatch")
+
     async def test_list_loras_endpoint(self) -> None:
         resp = await self.client.get("/loras")
         self.assertEqual(resp.status_code, 200)

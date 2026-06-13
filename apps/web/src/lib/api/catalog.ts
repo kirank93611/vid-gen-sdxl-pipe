@@ -11,6 +11,7 @@ export type ImageModelEntry = {
 export type LoraCatalogEntry = {
   lora_name: string;
   filename: string;
+  backend?: "sdxl" | "ltx" | "wan";
 };
 
 export type GenerationProfileEntry = {

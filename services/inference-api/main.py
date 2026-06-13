@@ -40,7 +40,11 @@ from device import get_runtime_device
 from generation_service import generate_image_bytes, inpaint_image_bytes
 import job_store
 import jobs as jobs_module
-from lora_utils import list_lora_names, resolve_lora_path
+from lora_utils import (
+    list_lora_names,
+    lora_backend_mismatch_message,
+    resolve_lora_path,
+)
 from rate_limit import check_and_record_rate_limit
 from registry import EngineRegistry
 from router import apply_generation_policy, list_profiles_payload, model_supports_lora
@@ -244,6 +248,18 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
                     "status": "error",
                     "error_code": "invalid_lora_name",
                     "message": str(exc),
+                    "request_id": request_id,
+                },
+                headers={"X-Request-ID": request_id},
+            )
+        mismatch = lora_backend_mismatch_message(payload.lora_name, model_id)
+        if mismatch:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "error_code": "lora_backend_mismatch",
+                    "message": mismatch,
                     "request_id": request_id,
                 },
                 headers={"X-Request-ID": request_id},
