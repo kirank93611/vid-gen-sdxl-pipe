@@ -7,6 +7,7 @@ export type AspectRatioId =
   | "4:3"
   | "16:9"
   | "9:16"
+  | "ltx"
   | "sd15";
 
 export const SCHEDULER_OPTIONS = [
@@ -32,6 +33,7 @@ export const ASPECT_RATIOS: {
   { id: "4:3", label: "4:3", width: 1024, height: 768 },
   { id: "16:9", label: "16:9", width: 1344, height: 768 },
   { id: "9:16", label: "9:16", width: 768, height: 1344 },
+  { id: "ltx", label: "768 LTX", width: 768, height: 512 },
   { id: "sd15", label: "512 SD1.5", width: 512, height: 512 },
 ];
 

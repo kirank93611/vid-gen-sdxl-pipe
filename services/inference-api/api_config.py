@@ -28,6 +28,9 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 
 SDXL_MODEL_PATH = os.environ.get("SDXL_MODEL_PATH", str(DEFAULT_MODEL_PATH))
 
+DEFAULT_LTX_MODEL_PATH = REPO_ROOT / "models" / "ltx-2.3" / "ltx-2.3-22b-dev.safetensors"
+LTX_MODEL_PATH = Path(os.environ.get("LTX_MODEL_PATH", str(DEFAULT_LTX_MODEL_PATH)))
+
 # Optional SDXL LoRAs: <repo>/models/loras/*.safetensors (see lora_utils.py)
 DEFAULT_LORAS_DIR = REPO_ROOT / "models" / "loras"
 LORAS_DIR = Path(os.environ.get("LORAS_DIR", str(DEFAULT_LORAS_DIR)))

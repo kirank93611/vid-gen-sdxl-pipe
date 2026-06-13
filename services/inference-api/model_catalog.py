@@ -10,9 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from api_config import REPO_ROOT, SDXL_MODEL_PATH
+from api_config import LTX_MODEL_PATH, REPO_ROOT, SDXL_MODEL_PATH
 
 ModelFamily = Literal["image", "chat"]
+ImageEngine = Literal["sdxl", "ltx2", "sd15"]
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,7 @@ class ImageModelSpec:
     model_id: str
     display_name: str
     local_path: Path
+    engine: ImageEngine = "sdxl"
     supports: tuple[str, ...] = (
         "text_to_image",
         "quality_tier_routing",
@@ -29,6 +31,13 @@ class ImageModelSpec:
     @property
     def family(self) -> ModelFamily:
         return "image"
+
+    def is_on_disk(self) -> bool:
+        if self.engine == "ltx2":
+            from ltx_engine import ltx_model_on_disk
+
+            return ltx_model_on_disk(self.local_path)
+        return self.local_path.is_dir()
 
 
 @dataclass(frozen=True)
@@ -65,6 +74,14 @@ IMAGE_MODELS: dict[str, ImageModelSpec] = {
         model_id="sdxl_base",
         display_name="SDXL 1.0 Base",
         local_path=Path(SDXL_MODEL_PATH),
+        engine="sdxl",
+    ),
+    "ltx_video": ImageModelSpec(
+        model_id="ltx_video",
+        display_name="LTX 2.3 Dev",
+        local_path=LTX_MODEL_PATH,
+        engine="ltx2",
+        supports=("text_to_video", "quality_tier_routing"),
     ),
 }
 
@@ -137,7 +154,8 @@ def list_models_payload() -> list[dict]:
                 "display_name": spec.display_name,
                 "family": "image",
                 "supports": list(spec.supports),
-                "on_disk": spec.local_path.is_dir(),
+                "backend": spec.engine if spec.engine != "sdxl" else "sdxl",
+                "on_disk": spec.is_on_disk(),
             }
         )
     for spec in CHAT_MODELS.values():

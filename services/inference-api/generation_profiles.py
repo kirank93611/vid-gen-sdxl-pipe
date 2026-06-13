@@ -19,6 +19,7 @@ ProfileId = Literal[
     "sdxl_balanced",
     "sdxl_quality",
     "sd15_standard",
+    "ltx_fast",
 ]
 
 DEFAULT_MODEL_ID = "sdxl_base"
@@ -34,7 +35,7 @@ class GenerationProfile:
     scheduler: str | None = None
     clip_skip: int | None = None
     lora_weight: float | None = None
-    backend: Literal["sdxl", "sd15", "any"] = "any"
+    backend: Literal["sdxl", "sd15", "ltx", "any"] = "any"
 
 
 PROFILES: dict[ProfileId, GenerationProfile] = {
@@ -105,6 +106,15 @@ PROFILES: dict[ProfileId, GenerationProfile] = {
         clip_skip=1,
         backend="sd15",
     ),
+    "ltx_fast": GenerationProfile(
+        profile_id="ltx_fast",
+        display_name="LTX Fast",
+        description="LTX video: 20 steps, CFG 4, 768×512-friendly.",
+        steps=20,
+        guidance_scale=4.0,
+        lora_weight=1.0,
+        backend="ltx",
+    ),
 }
 
 _LEGACY_TIER_TO_PROFILE: dict[str, ProfileId] = {
@@ -171,5 +181,9 @@ def apply_generation_policy(req: GenerateRequest) -> tuple[GenerateRequest, str]
 
 def model_supports_lora(model_id: str) -> bool:
     from checkpoint_utils import is_checkpoint_model_id
+    from lora_utils import image_model_lora_backend
 
-    return not is_checkpoint_model_id(model_id)
+    if is_checkpoint_model_id(model_id):
+        return False
+    backend = image_model_lora_backend(model_id)
+    return backend in ("sdxl", "ltx", "wan")

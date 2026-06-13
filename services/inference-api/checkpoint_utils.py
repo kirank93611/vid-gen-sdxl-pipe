@@ -37,10 +37,14 @@ def normalize_model_id(model_id: str | None) -> str:
         from generation_profiles import DEFAULT_MODEL_ID
 
         return DEFAULT_MODEL_ID
-    if model_id == "sdxl_base" or is_checkpoint_model_id(model_id):
+
+    from model_catalog import IMAGE_MODEL_IDS
+
+    if model_id in IMAGE_MODEL_IDS or is_checkpoint_model_id(model_id):
         return model_id
     raise ValueError(
-        f"Unknown model_id: {model_id}. Use sdxl_base or ckpt_<filename_stem>."
+        f"Unknown model_id: {model_id}. "
+        f"Use one of: {', '.join(sorted(IMAGE_MODEL_IDS))} or ckpt_<checkpoint_stem>."
     )
 
 

@@ -14,6 +14,7 @@ export type GenerationMetadata = {
 export type GenerateOk = {
   status: string;
   image_base64: string;
+  video_base64?: string | null;
   metadata?: GenerationMetadata;
 };
 

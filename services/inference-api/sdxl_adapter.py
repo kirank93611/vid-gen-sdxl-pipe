@@ -59,4 +59,7 @@ def build_metadata(
         "quality_tier": payload.quality_tier,
         "lora_name": effective.lora_name,
         "lora_weight": effective.lora_weight if effective.lora_name else None,
+        "num_frames": getattr(effective, "num_frames", None),
+        "frame_rate": getattr(effective, "frame_rate", None),
+        "media_type": "video/mp4" if model_id.startswith("ltx") else "image/jpeg",
     }

@@ -48,7 +48,7 @@ class GenerateRequest(BaseModel):
 
     model_id: str | None = Field(
         default=None,
-        description="Image backend: sdxl_base or ckpt_<checkpoint_stem> (SD 1.5 single file).",
+        description="Image/video backend: sdxl_base, ltx_video, or ckpt_<checkpoint_stem>.",
     )
     generation_profile: (
         Literal[
@@ -59,6 +59,7 @@ class GenerateRequest(BaseModel):
             "sdxl_balanced",
             "sdxl_quality",
             "sd15_standard",
+            "ltx_fast",
         ]
         | None
     ) = Field(
@@ -77,6 +78,9 @@ class GenerateRequest(BaseModel):
         description="LoRA catalog id → models/loras/<lora_name>.safetensors on disk.",
     )
     lora_weight: Annotated[float, Field(default=0.8, ge=0.0, le=2.0)]
+
+    num_frames: Annotated[int, Field(default=49, ge=9, le=121)]
+    frame_rate: Annotated[float, Field(default=24.0, ge=8.0, le=60.0)]
 
     @field_validator("scheduler")
     @classmethod
@@ -105,8 +109,10 @@ class GenerateResponse(BaseModel):
     """
     # High-level response status, expected "success" for this model.
     status: str
-    # Base64-encoded JPEG bytes.
+    # Base64-encoded JPEG poster frame (always set; first frame for video).
     image_base64: str
+    # Base64-encoded MP4 when model_id is a video backend (e.g. ltx_video).
+    video_base64: str | None = None
     # Structured fields used for debugging/analytics/reproducibility.
     metadata: dict[str, str | int | float | None]
 

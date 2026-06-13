@@ -274,6 +274,36 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(resp.json()["error_code"], "lora_backend_mismatch")
 
+    async def test_generate_ltx_lora_with_ltx_base_mocked(self) -> None:
+        class _LtxEngine:
+            media_type = "video/mp4"
+
+            def generate(self, req: Any, **_: Any) -> tuple[bytes, bytes, int]:
+                return b"mp4-bytes", b"poster-jpeg", 42
+
+        with mock.patch.object(main.registry, "get_engine", return_value=_LtxEngine()), mock.patch(
+            "ltx_engine.ltx_model_on_disk",
+            return_value=True,
+        ), mock.patch(
+            "main.resolve_lora_path",
+            return_value=Path("/tmp/fake-lora.safetensors"),
+        ):
+            resp = await self.client.post(
+                "/generate",
+                json={
+                    "prompt": "test video",
+                    "model_id": "ltx_video",
+                    "lora_name": "DR34ML4Y_LTXXX_V2",
+                    "generation_profile": "ltx_fast",
+                },
+                headers=self.API_HEADERS,
+            )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["status"], "success")
+        self.assertTrue(body.get("video_base64"))
+        self.assertEqual(body["metadata"]["model_id"], "ltx_video")
+
     async def test_list_loras_endpoint(self) -> None:
         resp = await self.client.get("/loras")
         self.assertEqual(resp.status_code, 200)
@@ -284,6 +314,7 @@ class IntegrationAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status_code, 200)
         ids = {p["profile_id"] for p in resp.json()["profiles"]}
         self.assertIn("lightning_4", ids)
+        self.assertIn("ltx_fast", ids)
         self.assertIn("custom", ids)
 
     async def test_generate_lightning_profile_metadata(self) -> None:

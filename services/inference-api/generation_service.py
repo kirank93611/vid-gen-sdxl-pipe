@@ -31,10 +31,14 @@ def _run_generate(
     engine: object,
     payload: GenerateRequest,
     cancel_event: threading.Event,
-) -> tuple[bytes, int, GenerateRequest, str]:
+) -> tuple[bytes, bytes | None, int, GenerateRequest, str]:
     effective, model_id = effective_request(payload)
-    image_bytes, used_seed = engine.generate(effective, cancel_event=cancel_event)  # type: ignore[attr-defined]
-    return image_bytes, used_seed, effective, model_id
+    raw = engine.generate(effective, cancel_event=cancel_event)  # type: ignore[attr-defined]
+    if len(raw) == 3:
+        video_bytes, poster_bytes, used_seed = raw
+        return poster_bytes, video_bytes, used_seed, effective, model_id
+    image_bytes, used_seed = raw
+    return image_bytes, None, used_seed, effective, model_id
 
 
 async def generate_image_bytes(
@@ -43,7 +47,7 @@ async def generate_image_bytes(
     registry: EngineRegistry,
     timeout_seconds: float,
     cancel_grace_seconds: float | None = None,
-) -> tuple[bytes, int, GenerateRequest, str]:
+) -> tuple[bytes, bytes | None, int, GenerateRequest, str]:
     """
     Run one inference step. Raises asyncio.TimeoutError on wall-clock timeout.
 

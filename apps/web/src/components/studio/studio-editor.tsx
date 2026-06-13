@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 
 export function StudioEditor() {
   const [imageSrc, setImageSrc] = useState<string | null>(null);
+  const [videoSrc, setVideoSrc] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [metaLine, setMetaLine] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -17,6 +18,7 @@ export function StudioEditor() {
     <div className="flex min-h-[calc(100vh-3.5rem)] flex-col">
       <StudioCanvas
         imageSrc={imageSrc}
+        videoSrc={videoSrc}
         loading={loading}
         metaLine={metaLine}
         dockMinimized={dockMinimized}
@@ -36,6 +38,7 @@ export function StudioEditor() {
 
       <GenerationDock
         onImage={setImageSrc}
+        onVideo={setVideoSrc}
         onLoading={setLoading}
         onMeta={setMetaLine}
         onError={setError}

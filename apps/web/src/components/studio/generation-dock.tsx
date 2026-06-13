@@ -21,6 +21,7 @@ import {
   SCHEDULER_OPTIONS,
   fieldClass,
   isCheckpointModelId,
+  isVideoModelId,
   modelKindLabel,
   findProfile,
   knobsFromProfile,
@@ -53,6 +54,7 @@ import { cn } from "@/lib/utils";
 
 type GenerationDockProps = {
   onImage: (src: string | null) => void;
+  onVideo?: (src: string | null) => void;
   onLoading: (loading: boolean) => void;
   onMeta: (line: string | null) => void;
   onError: (message: string | null) => void;
@@ -61,6 +63,7 @@ type GenerationDockProps = {
 
 export function GenerationDock({
   onImage,
+  onVideo,
   onLoading,
   onMeta,
   onError,
@@ -132,6 +135,7 @@ export function GenerationDock({
   }, [cooldownSec]);
 
   const isCheckpoint = isCheckpointModelId(modelId);
+  const isVideoModel = isVideoModelId(modelId);
   const modelBackend = imageModelLoraBackend(modelId);
   const activeLora = isCheckpoint ? "" : loraName.trim();
   const selectedLora = loras.find((l) => l.lora_name === activeLora);
@@ -153,7 +157,19 @@ export function GenerationDock({
       !isLoraCompatibleWithModel((l.backend ?? "sdxl") as LoraBackend, modelId),
   );
   const aspectDims = ASPECT_RATIOS.find((a) => a.id === aspect)!;
-  const sdxlModels = imageModels.filter((m) => !isCheckpointModelId(m.model_id));
+  const videoModels = imageModels.filter(
+    (m) =>
+      m.model_id.startsWith("ltx_") ||
+      m.model_id.startsWith("wan") ||
+      m.backend === "ltx2",
+  );
+  const sdxlModels = imageModels.filter(
+    (m) =>
+      !isCheckpointModelId(m.model_id) &&
+      !m.model_id.startsWith("ltx_") &&
+      !m.model_id.startsWith("wan") &&
+      m.backend !== "ltx2",
+  );
   const checkpointModels = imageModels.filter((m) => isCheckpointModelId(m.model_id));
 
   const applyPreset = useCallback(
@@ -182,10 +198,15 @@ export function GenerationDock({
       setNegativePrompt(DEFAULT_SD15_NEGATIVE);
       return;
     }
+    if (isVideoModel) {
+      applyPreset("ltx_fast");
+      setAspect("ltx");
+      return;
+    }
     if (activeLora.includes("lightning")) {
       applyPreset("lightning_4");
     }
-  }, [activeLora, applyPreset, isCheckpoint, modelId]);
+  }, [activeLora, applyPreset, isCheckpoint, isVideoModel, modelId]);
 
   useEffect(() => {
     if (!loraMismatch || !activeLora) return;
@@ -243,12 +264,17 @@ export function GenerationDock({
     onError(null);
     onMeta(null);
     onImage(null);
+    onVideo?.(null);
     setStatusLine(
       isCheckpoint
         ? `GPU · ${modelId}`
-        : activeLora
-          ? `GPU · LoRA ${activeLora} @ ${loraWeight}`
-          : "GPU · SDXL base",
+        : isVideoModel
+          ? activeLora
+            ? `GPU · LTX · LoRA ${activeLora} @ ${loraWeight}`
+            : `GPU · LTX video`
+          : activeLora
+            ? `GPU · LoRA ${activeLora} @ ${loraWeight}`
+            : "GPU · SDXL base",
     );
 
     try {
@@ -275,6 +301,11 @@ export function GenerationDock({
       }
 
       const ok = data as GenerateOk;
+      if (ok.video_base64) {
+        onVideo?.(`data:video/mp4;base64,${ok.video_base64}`);
+      } else {
+        onVideo?.(null);
+      }
       if (ok.image_base64) {
         onImage(`data:image/jpeg;base64,${ok.image_base64}`);
         const m = ok.metadata;
@@ -296,12 +327,14 @@ export function GenerationDock({
     cooldownSec,
     guidanceScale,
     isCheckpoint,
+    isVideoModel,
     loraMismatch,
     loraWeight,
     modelId,
     negativePrompt,
     onError,
     onImage,
+    onVideo,
     onLoading,
     onMeta,
     prompt,
@@ -577,6 +610,20 @@ export function GenerationDock({
                             </option>
                           ))}
                         </optgroup>
+                        {videoModels.length > 0 && (
+                          <optgroup label="Video base">
+                            {videoModels.map((m) => (
+                              <option
+                                key={m.model_id}
+                                value={m.model_id}
+                                disabled={m.on_disk === false}
+                              >
+                                {m.display_name}
+                                {m.on_disk === false ? " (download weights)" : ""}
+                              </option>
+                            ))}
+                          </optgroup>
+                        )}
                         {checkpointModels.length > 0 && (
                           <optgroup label="Checkpoints (SD 1.5)">
                             {checkpointModels.map((m) => (
@@ -599,7 +646,19 @@ export function GenerationDock({
                   <select
                     value={loraName}
                     disabled={loading || isCheckpoint || lorasLoading}
-                    onChange={(e) => setLoraName(e.target.value)}
+                    onChange={(e) => {
+                      const name = e.target.value;
+                      setLoraName(name);
+                      const entry = loras.find((l) => l.lora_name === name);
+                      if (entry?.backend === "ltx") {
+                        setModelId("ltx_video");
+                      } else if (
+                        entry?.backend === "sdxl" &&
+                        isVideoModelId(modelId)
+                      ) {
+                        setModelId("sdxl_base");
+                      }
+                    }}
                     className={cn(fieldClass, isCheckpoint && "opacity-50")}
                   >
                     <option value="">
@@ -641,8 +700,8 @@ export function GenerationDock({
                   </select>
                   {!isCheckpoint && incompatibleLoras.length > 0 && (
                     <span className="text-[10px] text-amber-200/90">
-                      Video LoRAs (LTX/Wan) need a matching base model — only SDXL
-                      LoRAs work with SDXL base today.
+                      Some LoRAs need LTX or Wan video base — switch base model to
+                      match.
                     </span>
                   )}
                   {lorasError && (
@@ -665,12 +724,17 @@ export function GenerationDock({
                     className={fieldClass}
                   >
                     {profiles
-                      .filter(
-                        (p) =>
-                          !isCheckpoint ||
-                          p.backend === "sd15" ||
-                          p.profile_id === "custom",
-                      )
+                      .filter((p) => {
+                        if (isCheckpoint) {
+                          return (
+                            p.backend === "sd15" || p.profile_id === "custom"
+                          );
+                        }
+                        if (isVideoModel) {
+                          return p.backend === "ltx" || p.profile_id === "custom";
+                        }
+                        return p.backend !== "sd15" && p.backend !== "ltx";
+                      })
                       .map((p) => (
                         <option key={p.profile_id} value={p.profile_id}>
                           {profileOptionLabel(p)}

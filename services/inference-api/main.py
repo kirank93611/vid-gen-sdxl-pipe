@@ -223,7 +223,7 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
                 content={
                     "status": "error",
                     "error_code": "lora_not_supported",
-                    "message": "LoRAs apply to SDXL base only, not SD 1.5 checkpoints.",
+                    "message": "LoRAs do not apply to SD 1.5 checkpoints.",
                     "request_id": request_id,
                 },
                 headers={"X-Request-ID": request_id},
@@ -268,6 +268,23 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
     try:
         if is_checkpoint_model_id(model_id):
             resolve_checkpoint_path(model_id)
+        elif model_id == "ltx_video":
+            from ltx_engine import ltx_model_on_disk, resolve_ltx_model_path
+
+            if not ltx_model_on_disk():
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "status": "error",
+                        "error_code": "model_not_on_disk",
+                        "message": (
+                            f"LTX weights missing at {resolve_ltx_model_path()}. "
+                            "Run: make download-ltx"
+                        ),
+                        "request_id": request_id,
+                    },
+                    headers={"X-Request-ID": request_id},
+                )
     except FileNotFoundError as exc:
         return JSONResponse(
             status_code=400,
@@ -317,7 +334,7 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
 
     start = time.perf_counter()
     try:
-        image_bytes, used_seed, effective, model_id = await generate_image_bytes(
+        image_bytes, video_bytes, used_seed, effective, model_id = await generate_image_bytes(
             payload,
             registry=registry,
             timeout_seconds=GENERATION_TIMEOUT_SECONDS,
@@ -364,10 +381,14 @@ async def generate(payload: GenerateRequest, http_request: Request) -> GenerateR
         _metrics["generate_success_total"] += 1
 
     image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+    video_base64 = (
+        base64.b64encode(video_bytes).decode("utf-8") if video_bytes else None
+    )
 
     return GenerateResponse(
         status="success",
         image_base64=image_base64,
+        video_base64=video_base64,
         metadata=build_metadata(effective, payload, model_id, used_seed),
     )
 

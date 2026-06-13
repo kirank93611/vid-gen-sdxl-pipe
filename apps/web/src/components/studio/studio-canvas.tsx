@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 
 type StudioCanvasProps = {
   imageSrc: string | null;
+  videoSrc?: string | null;
   loading?: boolean;
   metaLine?: string | null;
   dockMinimized?: boolean;
@@ -15,13 +16,14 @@ type StudioCanvasProps = {
 
 export function StudioCanvas({
   imageSrc,
+  videoSrc = null,
   loading = false,
   metaLine,
   dockMinimized = false,
 }: StudioCanvasProps) {
   return (
     <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center px-4 pb-2 pt-4 sm:px-8 sm:pt-6">
-      {!imageSrc && !loading && (
+      {!imageSrc && !videoSrc && !loading && (
       <div className="mb-4 text-center sm:mb-6">
         <motion.h1
           initial={{ opacity: 0, y: 8 }}
@@ -46,7 +48,7 @@ export function StudioCanvas({
 
       <div className="relative flex w-full max-w-4xl flex-1 items-center justify-center">
         <AnimatePresence mode="wait">
-          {loading && !imageSrc ? (
+          {loading && !imageSrc && !videoSrc ? (
             <motion.div
               key="loading"
               initial={{ opacity: 0, scale: 0.98 }}
@@ -59,6 +61,30 @@ export function StudioCanvas({
                 <Loader2 className="h-4 w-4 animate-spin text-[var(--studio-lime)]" />
                 Rendering on GPU…
               </div>
+            </motion.div>
+          ) : videoSrc ? (
+            <motion.div
+              key="video"
+              initial={{ opacity: 0, scale: 0.96, filter: "blur(8px)" }}
+              animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
+              exit={{ opacity: 0, scale: 0.98 }}
+              transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
+              className="relative overflow-hidden rounded-2xl border border-border/80 bg-card/40 shadow-2xl shadow-black/40"
+            >
+              <video
+                src={videoSrc}
+                controls
+                autoPlay
+                loop
+                muted
+                playsInline
+                className={cn(
+                  "w-auto object-contain",
+                  dockMinimized
+                    ? "max-h-[min(78vh,900px)]"
+                    : "max-h-[min(52vh,640px)]",
+                )}
+              />
             </motion.div>
           ) : imageSrc ? (
             <motion.div

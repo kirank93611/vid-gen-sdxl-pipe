@@ -1,4 +1,4 @@
-.PHONY: test-integration run benchmark-product clean download-llm download-tiefighter \
+.PHONY: test-integration run benchmark-product clean download-llm download-ltx download-tiefighter \
 	download-dolphin spheron-download-llm \
 	spheron-check spheron-set-ip \
 	spheron-sync spheron-setup spheron-up spheron-tunnel spheron-smoke spheron-benchmark \
@@ -66,6 +66,9 @@ download-tiefighter:
 
 download-dolphin:
 	$(MAKE) download-llm GGUF_MODEL_ID=dolphin_mixtral_8x7b
+
+download-ltx:
+	source $(VENV) && python scripts/download_ltx.py
 
 spheron-download-llm: spheron-check
 	$(SPHERON_SSH) $(SPHERON_HOST) 'cd $(SPHERON_DIR) && bash scripts/ensure_llama_cpp_cuda.sh && \
